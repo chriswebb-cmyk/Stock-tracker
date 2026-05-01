@@ -1,0 +1,21 @@
+name = "stock-tracker-ingest"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+# Cron runs every minute. The worker no-ops outside US market hours so we
+# don't burn through free-tier invocations on weekends/overnight.
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "stock-tracker"
+# Replace with the id printed by `wrangler d1 create stock-tracker`.
+database_id = "REPLACE_WITH_D1_ID"
+
+[vars]
+POLL_OPTIONS = "false"
+AV_REQUESTS_PER_MINUTE = "75"
+
+# Secrets are set with `wrangler secret put ALPHAVANTAGE_API_KEY` — never in
+# this file.

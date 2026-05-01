@@ -1,0 +1,111 @@
+import { useEffect, useState } from 'react';
+import { api } from './api';
+import type { Bar, BarInterval, IngestRun, Ticker } from '../../shared/types';
+import { Watchlist } from './components/Watchlist';
+import { PriceChart } from './components/PriceChart';
+import { IndicatorPanel } from './components/IndicatorPanel';
+import { StatusBar } from './components/StatusBar';
+
+const INTERVALS: BarInterval[] = ['1min', '5min', '15min', '60min'];
+
+export default function App() {
+  const [tickers, setTickers] = useState<Ticker[]>([]);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [interval, setInterval_] = useState<BarInterval>('1min');
+  const [bars, setBars] = useState<Bar[]>([]);
+  const [latestRun, setLatestRun] = useState<IngestRun | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    api
+      .tickers()
+      .then((ts) => {
+        setTickers(ts);
+        if (ts.length > 0 && !selected) setSelected(ts[0]?.symbol ?? null);
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!selected) return;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const data = await api.bars(selected, interval, 500);
+        if (!cancelled) setBars(data);
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      }
+    };
+    load();
+    const id = window.setInterval(load, 30_000); // refresh every 30s
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [selected, interval]);
+
+  useEffect(() => {
+    const load = () => api.ingestRuns(1).then((rs) => setLatestRun(rs[0] ?? null)).catch(() => {});
+    load();
+    const id = window.setInterval(load, 60_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  return (
+    <div className="h-full flex flex-col">
+      <header className="flex items-center justify-between border-b border-slate-800 px-4 py-2">
+        <div className="flex items-baseline gap-3">
+          <h1 className="text-lg font-semibold tracking-tight">Stock Tracker</h1>
+          <span className="text-xs text-slate-500">ML pattern signals · phase 1</span>
+        </div>
+        <StatusBar latest={latestRun} />
+      </header>
+
+      {error && (
+        <div className="bg-rose-950 text-rose-200 text-xs px-4 py-2 border-b border-rose-900">
+          {error}
+        </div>
+      )}
+
+      <div className="flex-1 grid grid-cols-[220px_1fr] min-h-0">
+        <aside className="border-r border-slate-800 overflow-y-auto">
+          <div className="px-4 py-3 text-xs uppercase tracking-wider text-slate-500">
+            Watchlist
+          </div>
+          <Watchlist tickers={tickers} selected={selected} onSelect={setSelected} />
+        </aside>
+
+        <main className="flex flex-col min-h-0">
+          <div className="flex items-center justify-between border-b border-slate-800 px-4 py-2">
+            <div className="text-base font-medium">{selected ?? '—'}</div>
+            <div className="flex gap-1">
+              {INTERVALS.map((iv) => (
+                <button
+                  key={iv}
+                  type="button"
+                  onClick={() => setInterval_(iv)}
+                  className={
+                    'px-2 py-1 text-xs rounded ' +
+                    (iv === interval
+                      ? 'bg-slate-700 text-white'
+                      : 'text-slate-400 hover:bg-slate-800')
+                  }
+                >
+                  {iv}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <IndicatorPanel bars={bars} />
+
+          <div className="flex-1 min-h-0">
+            <PriceChart bars={bars} />
+          </div>
+        </main>
+      </div>
+    </div>
+  );
+}

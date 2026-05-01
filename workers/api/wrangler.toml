@@ -1,0 +1,13 @@
+name = "stock-tracker-api"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "stock-tracker"
+# Same id as in workers/ingest/wrangler.toml.
+database_id = "REPLACE_WITH_D1_ID"
+
+[vars]
+# In dev keep '*'; tighten to your Netlify domain on deploy.
+ALLOWED_ORIGINS = "*"
