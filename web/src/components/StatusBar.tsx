@@ -33,7 +33,12 @@ export function StatusBar({ latest }: Props) {
       <span className="text-slate-400">
         Last poll {ago(ts)} · {latest.symbols} symbols · {latest.apiCalls} API calls
         {latest.errors > 0 && (
-          <span className="text-amber-300"> · {latest.errors} errors</span>
+          <span
+            className="text-amber-300"
+            title={latest.errorText ?? undefined}
+          >
+            {' · '}{latest.errors} errors
+          </span>
         )}
       </span>
     </div>

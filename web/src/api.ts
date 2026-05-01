@@ -6,7 +6,14 @@ async function getJson<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`);
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`API ${res.status}: ${text}`);
+    let message = text;
+    try {
+      const parsed = JSON.parse(text) as { error?: unknown };
+      if (typeof parsed.error === 'string') message = parsed.error;
+    } catch {
+      // body wasn't JSON; fall through with the raw text
+    }
+    throw new Error(`API ${res.status}: ${message || res.statusText}`);
   }
   return (await res.json()) as T;
 }
