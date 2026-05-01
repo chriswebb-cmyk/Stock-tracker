@@ -14,8 +14,7 @@ database_name = "stock-tracker"
 database_id = "REPLACE_WITH_D1_ID"
 
 [vars]
-POLL_OPTIONS = "false"
-AV_REQUESTS_PER_MINUTE = "75"
+FINNHUB_REQUESTS_PER_MINUTE = "60"
 
-# Secrets are set with `wrangler secret put ALPHAVANTAGE_API_KEY` — never in
+# Secrets are set with `wrangler secret put FINNHUB_API_KEY` — never in
 # this file.
