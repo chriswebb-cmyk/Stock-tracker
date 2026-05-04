@@ -130,6 +130,17 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
       .filter(Boolean),
   );
 
+  let yahooOk = 0;
+  let finnhubFallback = 0;
+  let errors = 0;
+  let signalsFound = 0;
+  let suppressedByMl = 0;
+  let notified = 0;
+  let allBars: Bar[] = [];
+  let errorText: string | null = null;
+
+  try {
+
   // Load models + cooldown map up-front so we don't hit D1 inside the inner loop.
   const modelRows = await loadModels(env.DB);
   const models = new Map<SetupName, Model>();
@@ -146,13 +157,6 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
     env.DB,
     Math.floor(now.getTime() / 1000) - cooldownSec,
   );
-
-  let yahooOk = 0;
-  let finnhubFallback = 0;
-  let errors = 0;
-  let signalsFound = 0;
-  let suppressedByMl = 0;
-  let errorText: string | null = null;
 
   // Fan out Yahoo fetches concurrently. Each fetch is one subrequest; with
   // chunked symbol lists we stay well under the 50-per-invocation cap.
@@ -213,7 +217,7 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
   }
 
   // Single batched bar upsert for everything we just fetched.
-  const allBars: Bar[] = fetched.flatMap((f) => f.bars);
+  allBars = fetched.flatMap((f) => f.bars);
   if (allBars.length > 0) {
     await upsertBars(env.DB, allBars);
   }
@@ -272,7 +276,6 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
     await batchInsertSignals(env.DB, signalsToInsert);
   }
 
-  let notified = 0;
   if (webhookUrl && signalsToFire.length > 0) {
     try {
       await postDiscordSignals(webhookUrl, signalsToFire);
@@ -282,8 +285,18 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
       errorText = errorText ? `${errorText}\ndiscord: ${msg}` : `discord: ${msg}`;
     }
   }
+  } catch (err) {
+    errors += 1;
+    const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    errorText = errorText ? `${errorText}\nfatal: ${msg}` : `fatal: ${msg}`;
+  } finally {
+    try {
+      await finishIngestRun(env.DB, runId, symbols.length, yahooOk + finnhubFallback, errors, errorText);
+    } catch (err) {
+      console.error('finishIngestRun failed', err);
+    }
+  }
 
-  await finishIngestRun(env.DB, runId, symbols.length, yahooOk + finnhubFallback, errors, errorText);
   return {
     ran: true,
     chunk: chunkIdx,

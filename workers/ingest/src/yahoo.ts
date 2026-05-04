@@ -53,19 +53,34 @@ const YAHOO_INTERVAL: Record<BarInterval, string> = {
 };
 
 export class YahooClient {
-  async chart(symbol: string, interval: BarInterval, range: string): Promise<YahooFetchResult> {
+  async chart(symbol: string, interval: BarInterval, range: string, timeoutMs = 6_000): Promise<YahooFetchResult> {
     const url = new URL(`${BASE}/${encodeURIComponent(symbol)}`);
     url.searchParams.set('interval', YAHOO_INTERVAL[interval]);
     url.searchParams.set('range', range);
     url.searchParams.set('includePrePost', 'false');
 
-    const res = await fetch(url.toString(), {
-      headers: {
-        // Yahoo blocks default fetch UA. Anything browser-ish works.
-        'User-Agent': 'Mozilla/5.0 (compatible; stock-tracker/0.1)',
-        Accept: 'application/json',
-      },
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    let res: Response;
+    try {
+      res = await fetch(url.toString(), {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; stock-tracker/0.1)',
+          Accept: 'application/json',
+        },
+        signal: controller.signal,
+      });
+    } catch (err) {
+      clearTimeout(timeout);
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw new YahooError(`Yahoo timeout for ${symbol}`);
+      }
+      throw err;
+    }
+    clearTimeout(timeout);
+    if (res.status === 429) {
+      throw new YahooError(`Yahoo rate limit for ${symbol}`);
+    }
     if (!res.ok) {
       throw new YahooError(`HTTP ${res.status} from Yahoo for ${symbol}`);
     }
