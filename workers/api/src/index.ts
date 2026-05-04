@@ -14,6 +14,16 @@ export interface Env {
 const VALID_INTERVALS: BarInterval[] = ['1min', '5min', '15min', '30min', '60min'];
 
 export default {
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    // Weekly retrain on whatever bars are in D1 right now. Logs the result on
+    // the worker's tail; failure here is non-fatal (next week tries again).
+    ctx.waitUntil(
+      trainModels(env.DB, 7, 30, 1800).catch((err) => {
+        console.error('weekly retrain failed', err);
+      }),
+    );
+  },
+
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const origin = request.headers.get('Origin');

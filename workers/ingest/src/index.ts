@@ -25,8 +25,11 @@ export interface Env {
   // Cooldown in seconds between identical (symbol, setup) alerts. Default 1800 (30 min).
   SIGNAL_COOLDOWN_SECONDS?: string;
   // Minimum ML probability to send a Discord alert. Signals below this are
-  // still saved to the signals table but suppressed from Discord. Default 0.55.
+  // still saved to the signals table but suppressed from Discord. Default 0.60.
   ML_DISCORD_THRESHOLD?: string;
+  // Comma-separated list of setup names that should never fire. Useful for
+  // turning off setups whose backtest shows no edge.
+  DISABLED_SETUPS?: string;
 }
 
 function isMarketHoursEt(d: Date): boolean {
@@ -125,7 +128,13 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
     });
     if (m) models.set(setup as SetupName, m);
   }
-  const mlThreshold = Number(env.ML_DISCORD_THRESHOLD ?? '0.55');
+  const mlThreshold = Number(env.ML_DISCORD_THRESHOLD ?? '0.60');
+  const disabled = new Set(
+    (env.DISABLED_SETUPS ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+  );
 
   let apiCalls = 0;
   let yahooOk = 0;
@@ -187,6 +196,7 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
 
     const detected = detectSetups(symbol, historyBars, prevClose);
     for (const sig of detected) {
+      if (disabled.has(sig.setup)) continue;
       signalsFound += 1;
       const last = await lastSignalTs(env.DB, sig.symbol, sig.setup);
       if (last !== null && sig.ts - last < cooldownSec) continue;

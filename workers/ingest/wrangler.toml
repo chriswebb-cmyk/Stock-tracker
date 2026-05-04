@@ -15,6 +15,11 @@ database_id = "REPLACE_WITH_D1_ID"
 
 [vars]
 FINNHUB_REQUESTS_PER_MINUTE = "60"
+ML_DISCORD_THRESHOLD = "0.60"
+# Comma-separated list of setups whose signals are dropped before reaching
+# Discord. Defaults to the two setups whose backtested ML score didn't beat
+# the majority-class baseline.
+DISABLED_SETUPS = "vwap_reclaim_long,bb_squeeze_release_short"
 
 # Secrets are set with `wrangler secret put FINNHUB_API_KEY` — never in
 # this file.

@@ -18,6 +18,33 @@ export interface BacktestSummary {
   bySetup: SetupStats[];
 }
 
+export interface ModelRow {
+  setup: string;
+  trained_at: number;
+  sample_count: number;
+  train_accuracy: number;
+  val_accuracy: number;
+  train_baseline: number;
+}
+
+export interface SignalRow {
+  id: number;
+  symbol: string;
+  ts: number;
+  setup: string;
+  direction: 'long' | 'short';
+  ml_probability: number | null;
+  features_json: string | null;
+  contract_pick: string | null;
+  notes: string | null;
+}
+
+export interface TrainResult {
+  perSetup: Array<{ setup: string; samples: number; trainAcc: number; valAcc: number; baseline: number }>;
+  symbols: number;
+  trades: number;
+}
+
 export const api = {
   tickers: () => getJson<Ticker[]>('/tickers'),
   bars: (symbol: string, interval: BarInterval = '1min', limit = 500) =>
@@ -29,4 +56,11 @@ export const api = {
     getJson<BacktestResult>(
       `/backtest/${encodeURIComponent(symbol)}?days=${days}&hold=${hold}${includeTrades ? '&trades=1' : ''}`,
     ),
+  models: () => getJson<ModelRow[]>('/ml/models'),
+  signals: (limit = 50) => getJson<SignalRow[]>(`/signals?limit=${limit}`),
+  trainModels: async (days = 7, hold = 30) => {
+    const res = await fetch(`${BASE}/ml/train?days=${days}&hold=${hold}`);
+    if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
+    return (await res.json()) as TrainResult;
+  },
 };
