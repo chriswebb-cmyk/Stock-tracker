@@ -5,18 +5,18 @@ import {
   insertSignal,
   lastSignalTs,
   listEnabledTickers,
+  loadRecentBars,
   startIngestRun,
   upsertBars,
 } from './db';
-import { detectSignals } from './signals';
+import { detectSetups } from './setups';
 import { postDiscordSignal } from './discord';
+import type { Bar } from '../../../shared/types';
 
 export interface Env {
   DB: D1Database;
   FINNHUB_API_KEY: string;
-  // Optional. If set, signals are POSTed to this Discord webhook URL.
   DISCORD_WEBHOOK_URL?: string;
-  // Requests per minute available on your Finnhub plan. Defaults to 60 (free tier).
   FINNHUB_REQUESTS_PER_MINUTE?: string;
   // Cooldown in seconds between identical (symbol, setup) alerts. Default 1800 (30 min).
   SIGNAL_COOLDOWN_SECONDS?: string;
@@ -59,12 +59,13 @@ export default {
         await postDiscordSignal(env.DISCORD_WEBHOOK_URL, {
           symbol: 'TEST',
           ts: Math.floor(Date.now() / 1000),
-          setup: 'big_move_up',
+          setup: 'vwap_reclaim_long',
           direction: 'long',
           price: 123.45,
           prevClose: 120.00,
           changePct: 0.02875,
           notes: 'Test alert from /test-discord',
+          features: { rsi: 42, vwap: 122.10, atr: 0.85 },
         });
         return Response.json({ ok: true });
       } catch (err) {
@@ -114,8 +115,8 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
   let errorText: string | null = null;
 
   for (const symbol of tickers) {
-    let signalQuote: { current: number; dayOpen: number; dayHigh: number; dayLow: number; prevClose: number } | null = null;
-    let signalTs: number | null = null;
+    let prevClose: number | null = null;
+    let newBars: Bar[] = [];
 
     try {
       const result = await yahoo.latest(symbol, '1min');
@@ -124,22 +125,8 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
       if (result.bars.length > 0) {
         await upsertBars(env.DB, result.bars);
         barsWritten += result.bars.length;
-        const last = result.bars[result.bars.length - 1];
-        if (
-          result.prevClose != null &&
-          result.dayHigh != null &&
-          result.dayLow != null &&
-          result.dayOpen != null
-        ) {
-          signalQuote = {
-            current: result.current ?? last.close,
-            dayOpen: result.dayOpen,
-            dayHigh: result.dayHigh,
-            dayLow: result.dayLow,
-            prevClose: result.prevClose,
-          };
-          signalTs = last.ts;
-        }
+        newBars = result.bars;
+        prevClose = result.prevClose;
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -154,8 +141,8 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
           if (result) {
             await upsertBars(env.DB, [result.bar]);
             barsWritten += 1;
-            signalQuote = result.quote;
-            signalTs = result.bar.ts;
+            newBars = [result.bar];
+            prevClose = result.quote.prevClose;
           }
         } catch (fbErr) {
           errors += 1;
@@ -168,33 +155,31 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
       }
     }
 
-    if (signalQuote && signalTs !== null) {
-      const detected = detectSignals(symbol, signalTs, signalQuote);
-      for (const sig of detected) {
-        signalsFound += 1;
-        const last = await lastSignalTs(env.DB, sig.symbol, sig.setup);
-        if (last !== null && sig.ts - last < cooldownSec) continue;
+    if (newBars.length === 0 || prevClose === null) continue;
 
-        const features = JSON.stringify({
-          price: sig.price,
-          prev_close: sig.prevClose,
-          change_pct: sig.changePct,
-          day_high: signalQuote.dayHigh,
-          day_low: signalQuote.dayLow,
-          day_open: signalQuote.dayOpen,
-        });
-        await insertSignal(env.DB, sig.symbol, sig.ts, sig.setup, sig.direction, sig.notes, features);
+    // Setup detection needs more history than the latest fetch usually returns.
+    // Pull the most recent ~200 bars from D1 (now including what we just wrote).
+    const historyBars = await loadRecentBars(env.DB, symbol, '1min', 200);
+    if (historyBars.length < 30) continue;
 
-        if (webhookUrl) {
-          try {
-            await postDiscordSignal(webhookUrl, sig);
-            notified += 1;
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            errorText = errorText
-              ? `${errorText}\n${symbol} discord: ${msg}`
-              : `${symbol} discord: ${msg}`;
-          }
+    const detected = detectSetups(symbol, historyBars, prevClose);
+    for (const sig of detected) {
+      signalsFound += 1;
+      const last = await lastSignalTs(env.DB, sig.symbol, sig.setup);
+      if (last !== null && sig.ts - last < cooldownSec) continue;
+
+      const features = JSON.stringify(sig.features);
+      await insertSignal(env.DB, sig.symbol, sig.ts, sig.setup, sig.direction, sig.notes, features);
+
+      if (webhookUrl) {
+        try {
+          await postDiscordSignal(webhookUrl, sig);
+          notified += 1;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          errorText = errorText
+            ? `${errorText}\n${symbol} discord: ${msg}`
+            : `${symbol} discord: ${msg}`;
         }
       }
     }
@@ -214,8 +199,6 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
   };
 }
 
-// Pulls `days` of 1-min bars (Yahoo caps at 7d for 1m) for every enabled
-// ticker and stores them. Run once after deploy to seed history.
 async function runBackfill(env: Env, days: number): Promise<{
   symbols: number;
   barsWritten: number;

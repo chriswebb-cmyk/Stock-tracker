@@ -53,6 +53,45 @@ export async function insertOptionsSnapshot(db: D1Database, contracts: OptionCon
   return contracts.length;
 }
 
+export async function loadRecentBars(
+  db: D1Database,
+  symbol: string,
+  interval: string,
+  limit: number,
+): Promise<import('../../../shared/types').Bar[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT symbol, interval, ts, open, high, low, close, volume
+         FROM bars
+        WHERE symbol = ? AND interval = ?
+        ORDER BY ts DESC
+        LIMIT ?`,
+    )
+    .bind(symbol, interval, limit)
+    .all<{
+      symbol: string;
+      interval: string;
+      ts: number;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+    }>();
+  return results
+    .map((r) => ({
+      symbol: r.symbol,
+      interval: r.interval as import('../../../shared/types').BarInterval,
+      ts: r.ts,
+      open: r.open,
+      high: r.high,
+      low: r.low,
+      close: r.close,
+      volume: r.volume,
+    }))
+    .reverse();
+}
+
 export async function lastSignalTs(
   db: D1Database,
   symbol: string,
