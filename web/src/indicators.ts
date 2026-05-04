@@ -63,6 +63,30 @@ export function rsi(closes: number[], period = 14): (number | null)[] {
   return out;
 }
 
+export interface BollingerPoint {
+  middle: number | null;
+  upper: number | null;
+  lower: number | null;
+}
+
+export function bollinger(values: number[], period = 20, mult = 2): BollingerPoint[] {
+  const out: BollingerPoint[] = values.map(() => ({ middle: null, upper: null, lower: null }));
+  if (values.length < period) return out;
+  for (let i = period - 1; i < values.length; i++) {
+    let sum = 0;
+    for (let j = i - period + 1; j <= i; j++) sum += values[j] ?? 0;
+    const mean = sum / period;
+    let varSum = 0;
+    for (let j = i - period + 1; j <= i; j++) {
+      const d = (values[j] ?? 0) - mean;
+      varSum += d * d;
+    }
+    const sd = Math.sqrt(varSum / period);
+    out[i] = { middle: mean, upper: mean + mult * sd, lower: mean - mult * sd };
+  }
+  return out;
+}
+
 // Session VWAP. Resets at the start of each US trading session (09:30 ET).
 // Approximates the session boundary by looking for a >= 12-hour gap between
 // consecutive bars, which is robust enough for daily-session intraday data.

@@ -2,6 +2,10 @@ name = "stock-tracker-api"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
 
+# Sundays at 06:00 UTC (≈02:00 ET) — markets closed, no contention with ingest.
+[triggers]
+crons = ["0 6 * * SUN"]
+
 [[d1_databases]]
 binding = "DB"
 database_name = "stock-tracker"

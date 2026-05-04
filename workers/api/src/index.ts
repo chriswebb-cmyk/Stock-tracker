@@ -1,4 +1,8 @@
 import type { Bar, BarInterval, Ticker, IngestRun } from '../../../shared/types';
+import { backtest, combineResults, type BacktestResult, type SetupStats } from '../../../shared/backtest';
+import { trainLogReg, modelToJson, type ModelStats } from '../../../shared/ml';
+import { FEATURE_NAMES, featuresToVector } from '../../../shared/features';
+import type { SetupName } from '../../../shared/setups';
 
 export interface Env {
   DB: D1Database;
@@ -10,6 +14,24 @@ export interface Env {
 const VALID_INTERVALS: BarInterval[] = ['1min', '5min', '15min', '30min', '60min'];
 
 export default {
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      (async () => {
+        try {
+          await trainModels(env.DB, 7, 30, 1800);
+        } catch (err) {
+          console.error('weekly retrain failed', err);
+        }
+        try {
+          const summary = await getBacktestSummary(env.DB, 7, 30, 1800);
+          await writeCache(env.DB, 'backtest-summary-7-30-1800', JSON.stringify(summary));
+        } catch (err) {
+          console.error('backtest cache refresh failed', err);
+        }
+      })(),
+    );
+  },
+
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const origin = request.headers.get('Origin');
@@ -74,6 +96,49 @@ async function route(url: URL, request: Request, env: Env): Promise<unknown> {
   if (path === '/signals' && request.method === 'GET') {
     const limit = clampInt(url.searchParams.get('limit'), 1, 200, 50);
     return getSignals(env.DB, limit);
+  }
+
+  // /signals/by-symbol/:symbol?days=N
+  const sigSymMatch = path.match(/^\/signals\/by-symbol\/([A-Za-z.\-]+)$/);
+  if (sigSymMatch && request.method === 'GET') {
+    const symbol = sigSymMatch[1].toUpperCase();
+    const days = clampInt(url.searchParams.get('days'), 1, 30, 7);
+    return getSignalsForSymbol(env.DB, symbol, days);
+  }
+
+  // /backtest/:symbol?days=7&hold=30&cooldown=1800
+  const btMatch = path.match(/^\/backtest\/([A-Za-z.\-]+)$/);
+  if (btMatch && request.method === 'GET') {
+    const symbol = btMatch[1].toUpperCase();
+    const days = clampInt(url.searchParams.get('days'), 1, 30, 7);
+    const hold = clampInt(url.searchParams.get('hold'), 1, 240, 30);
+    const cooldown = clampInt(url.searchParams.get('cooldown'), 0, 86400, 1800);
+    const includeTrades = url.searchParams.get('trades') === '1';
+    const result = await runBacktest(env.DB, symbol, days, hold, cooldown);
+    return includeTrades ? result : { ...result, trades: [] };
+  }
+
+  // /ml/train?days=7&hold=30 — runs backtest, trains per-setup logreg, persists.
+  if (path === '/ml/train' && (request.method === 'POST' || request.method === 'GET')) {
+    const days = clampInt(url.searchParams.get('days'), 1, 30, 7);
+    const hold = clampInt(url.searchParams.get('hold'), 1, 240, 30);
+    const cooldown = clampInt(url.searchParams.get('cooldown'), 0, 86400, 1800);
+    return trainModels(env.DB, days, hold, cooldown);
+  }
+
+  if (path === '/ml/models' && request.method === 'GET') {
+    return getModels(env.DB);
+  }
+
+  // /backtest-summary?days=7&hold=30 — aggregated across all enabled tickers.
+  // Cached in D1 because the full sweep blows the free-tier 10ms CPU budget.
+  // Pass &refresh=1 to bypass cache (may 503 on free tier).
+  if (path === '/backtest-summary' && request.method === 'GET') {
+    const days = clampInt(url.searchParams.get('days'), 1, 30, 7);
+    const hold = clampInt(url.searchParams.get('hold'), 1, 240, 30);
+    const cooldown = clampInt(url.searchParams.get('cooldown'), 0, 86400, 1800);
+    const refresh = url.searchParams.get('refresh') === '1';
+    return getCachedBacktestSummary(env.DB, days, hold, cooldown, refresh);
   }
 
   throw new HttpError(404, 'not found');
@@ -195,6 +260,196 @@ async function getIngestRuns(db: D1Database, limit: number): Promise<IngestRun[]
     errors: r.errors,
     errorText: r.error_text,
   }));
+}
+
+async function loadBarsSince(
+  db: D1Database,
+  symbol: string,
+  interval: BarInterval,
+  sinceTs: number,
+): Promise<Bar[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT symbol, interval, ts, open, high, low, close, volume
+         FROM bars
+        WHERE symbol = ? AND interval = ? AND ts >= ?
+        ORDER BY ts ASC`,
+    )
+    .bind(symbol, interval, sinceTs)
+    .all<Bar>();
+  return results;
+}
+
+async function runBacktest(
+  db: D1Database,
+  symbol: string,
+  days: number,
+  holdMinutes: number,
+  cooldownSec: number,
+): Promise<BacktestResult> {
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+  const bars = await loadBarsSince(db, symbol, '1min', sinceTs);
+  return backtest(symbol, bars, holdMinutes, cooldownSec);
+}
+
+async function getCachedBacktestSummary(
+  db: D1Database,
+  days: number,
+  holdMinutes: number,
+  cooldownSec: number,
+  refresh: boolean,
+): Promise<{ symbols: number; trades: number; bySetup: SetupStats[]; cachedAt: number | null; stale: boolean }> {
+  const key = `backtest-summary-${days}-${holdMinutes}-${cooldownSec}`;
+  if (!refresh) {
+    const row = await db
+      .prepare('SELECT value, updated_at FROM json_cache WHERE key = ?')
+      .bind(key)
+      .first<{ value: string; updated_at: number }>();
+    if (row) {
+      const ageHours = (Math.floor(Date.now() / 1000) - row.updated_at) / 3600;
+      const parsed = JSON.parse(row.value) as { symbols: number; trades: number; bySetup: SetupStats[] };
+      return { ...parsed, cachedAt: row.updated_at, stale: ageHours > 24 };
+    }
+  }
+  const fresh = await getBacktestSummary(db, days, holdMinutes, cooldownSec);
+  await writeCache(db, key, JSON.stringify(fresh));
+  return { ...fresh, cachedAt: Math.floor(Date.now() / 1000), stale: false };
+}
+
+async function writeCache(db: D1Database, key: string, value: string): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO json_cache(key, value, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    )
+    .bind(key, value, Math.floor(Date.now() / 1000))
+    .run();
+}
+
+async function getBacktestSummary(
+  db: D1Database,
+  days: number,
+  holdMinutes: number,
+  cooldownSec: number,
+): Promise<{ symbols: number; trades: number; bySetup: SetupStats[] }> {
+  const tickers = await db
+    .prepare('SELECT symbol FROM tickers WHERE enabled = 1 ORDER BY symbol')
+    .all<{ symbol: string }>();
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+  const results: BacktestResult[] = [];
+  for (const { symbol } of tickers.results) {
+    const bars = await loadBarsSince(db, symbol, '1min', sinceTs);
+    if (bars.length < 30) continue;
+    results.push(backtest(symbol, bars, holdMinutes, cooldownSec));
+  }
+  const totalTrades = results.reduce((sum, r) => sum + r.trades.length, 0);
+  return {
+    symbols: results.length,
+    trades: totalTrades,
+    bySetup: combineResults(results),
+  };
+}
+
+async function trainModels(
+  db: D1Database,
+  days: number,
+  holdMinutes: number,
+  cooldownSec: number,
+): Promise<{
+  perSetup: Array<{ setup: SetupName; samples: number; trainAcc: number; valAcc: number; baseline: number }>;
+  symbols: number;
+  trades: number;
+}> {
+  const tickers = await db
+    .prepare('SELECT symbol FROM tickers WHERE enabled = 1 ORDER BY symbol')
+    .all<{ symbol: string }>();
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+
+  const bySetup = new Map<SetupName, { X: number[][]; y: number[] }>();
+  let totalTrades = 0;
+  let symbolsUsed = 0;
+
+  for (const { symbol } of tickers.results) {
+    const bars = await loadBarsSince(db, symbol, '1min', sinceTs);
+    if (bars.length < 30) continue;
+    symbolsUsed += 1;
+    const result = backtest(symbol, bars, holdMinutes, cooldownSec);
+    for (const t of result.trades) {
+      totalTrades += 1;
+      const bucket = bySetup.get(t.setup) ?? { X: [], y: [] };
+      bucket.X.push(featuresToVector(t.features));
+      bucket.y.push(t.pnlPct > 0 ? 1 : 0);
+      bySetup.set(t.setup, bucket);
+    }
+  }
+
+  const trainedAt = Math.floor(Date.now() / 1000);
+  const perSetup: Array<{ setup: SetupName; samples: number; trainAcc: number; valAcc: number; baseline: number }> = [];
+
+  for (const [setup, { X, y }] of bySetup) {
+    if (X.length < 30) continue;
+    const trained = trainLogReg(X, y);
+    const stats: ModelStats = trained.stats;
+    const json = modelToJson({
+      setup,
+      featureNames: FEATURE_NAMES,
+      means: trained.means,
+      stds: trained.stds,
+      weights: trained.weights,
+      bias: trained.bias,
+      trainedAt,
+      stats,
+    });
+    await db
+      .prepare(
+        `INSERT INTO models(setup, trained_at, sample_count, train_accuracy,
+                            val_accuracy, train_baseline, weights_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(setup) DO UPDATE SET
+           trained_at = excluded.trained_at,
+           sample_count = excluded.sample_count,
+           train_accuracy = excluded.train_accuracy,
+           val_accuracy = excluded.val_accuracy,
+           train_baseline = excluded.train_baseline,
+           weights_json = excluded.weights_json`,
+      )
+      .bind(setup, trainedAt, stats.sampleCount, stats.trainAccuracy, stats.valAccuracy, stats.trainBaseline, json)
+      .run();
+    perSetup.push({
+      setup,
+      samples: stats.sampleCount,
+      trainAcc: stats.trainAccuracy,
+      valAcc: stats.valAccuracy,
+      baseline: stats.trainBaseline,
+    });
+  }
+
+  perSetup.sort((a, b) => a.setup.localeCompare(b.setup));
+  return { perSetup, symbols: symbolsUsed, trades: totalTrades };
+}
+
+async function getModels(db: D1Database): Promise<unknown[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT setup, trained_at, sample_count, train_accuracy, val_accuracy,
+              train_baseline FROM models ORDER BY setup`,
+    )
+    .all();
+  return results;
+}
+
+async function getSignalsForSymbol(db: D1Database, symbol: string, days: number): Promise<unknown[]> {
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+  const { results } = await db
+    .prepare(
+      `SELECT id, symbol, ts, setup, direction, ml_probability, notes
+         FROM signals
+        WHERE symbol = ? AND ts >= ?
+        ORDER BY ts ASC`,
+    )
+    .bind(symbol, sinceTs)
+    .all();
+  return results;
 }
 
 async function getSignals(db: D1Database, limit: number): Promise<unknown[]> {
