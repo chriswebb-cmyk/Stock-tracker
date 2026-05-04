@@ -223,8 +223,12 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
     errorText = errorText ? `${errorText}\n${note}` : note;
   }
 
-  // Single batched bar upsert for everything we just fetched.
-  allBars = fetched.flatMap((f) => f.bars);
+  // Single batched bar upsert. We pulled 2 days from Yahoo for indicator
+  // warmup, but D1 already has the older bars from prior runs/backfill — only
+  // upsert the trailing tail per symbol (covers any minutes we missed since
+  // last poll) so the batch stays under D1's per-call limits.
+  const TAIL_BARS = 10;
+  allBars = fetched.flatMap((f) => f.bars.slice(-TAIL_BARS));
   if (allBars.length > 0) {
     await upsertBars(env.DB, allBars);
   }

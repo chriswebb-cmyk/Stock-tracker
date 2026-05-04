@@ -9,7 +9,6 @@ export async function listEnabledTickers(db: D1Database): Promise<string[]> {
 
 export async function upsertBars(db: D1Database, bars: Bar[]): Promise<number> {
   if (bars.length === 0) return 0;
-  // D1 batches statements together for atomicity + a single round trip.
   const stmt = db.prepare(
     `INSERT INTO bars(symbol, interval, ts, open, high, low, close, volume)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -20,10 +19,15 @@ export async function upsertBars(db: D1Database, bars: Bar[]): Promise<number> {
        close = excluded.close,
        volume = excluded.volume`,
   );
-  const batch = bars.map((b) =>
-    stmt.bind(b.symbol, b.interval, b.ts, b.open, b.high, b.low, b.close, b.volume),
-  );
-  await db.batch(batch);
+  // D1 batches are bounded; chunk to 500 statements to stay safely below the
+  // documented 1000-statement-per-call ceiling. Keeps wall-clock predictable.
+  const CHUNK = 500;
+  for (let i = 0; i < bars.length; i += CHUNK) {
+    const slice = bars.slice(i, i + CHUNK);
+    await db.batch(
+      slice.map((b) => stmt.bind(b.symbol, b.interval, b.ts, b.open, b.high, b.low, b.close, b.volume)),
+    );
+  }
   return bars.length;
 }
 
