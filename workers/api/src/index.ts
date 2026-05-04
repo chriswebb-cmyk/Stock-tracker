@@ -98,6 +98,14 @@ async function route(url: URL, request: Request, env: Env): Promise<unknown> {
     return getSignals(env.DB, limit);
   }
 
+  // /signals/by-symbol/:symbol?days=N
+  const sigSymMatch = path.match(/^\/signals\/by-symbol\/([A-Za-z.\-]+)$/);
+  if (sigSymMatch && request.method === 'GET') {
+    const symbol = sigSymMatch[1].toUpperCase();
+    const days = clampInt(url.searchParams.get('days'), 1, 30, 7);
+    return getSignalsForSymbol(env.DB, symbol, days);
+  }
+
   // /backtest/:symbol?days=7&hold=30&cooldown=1800
   const btMatch = path.match(/^\/backtest\/([A-Za-z.\-]+)$/);
   if (btMatch && request.method === 'GET') {
@@ -426,6 +434,20 @@ async function getModels(db: D1Database): Promise<unknown[]> {
       `SELECT setup, trained_at, sample_count, train_accuracy, val_accuracy,
               train_baseline FROM models ORDER BY setup`,
     )
+    .all();
+  return results;
+}
+
+async function getSignalsForSymbol(db: D1Database, symbol: string, days: number): Promise<unknown[]> {
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+  const { results } = await db
+    .prepare(
+      `SELECT id, symbol, ts, setup, direction, ml_probability, notes
+         FROM signals
+        WHERE symbol = ? AND ts >= ?
+        ORDER BY ts ASC`,
+    )
+    .bind(symbol, sinceTs)
     .all();
   return results;
 }

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { api } from './api';
+import { api, type SignalRow } from './api';
 import type { Bar, BarInterval, IngestRun, Ticker } from '../../shared/types';
 import { Watchlist } from './components/Watchlist';
 import { PriceChart } from './components/PriceChart';
@@ -17,6 +17,7 @@ export default function App() {
   const [selected, setSelected] = useState<string | null>(null);
   const [interval, setInterval_] = useState<BarInterval>('1min');
   const [bars, setBars] = useState<Bar[]>([]);
+  const [signals, setSignals] = useState<SignalRow[]>([]);
   const [latestRun, setLatestRun] = useState<IngestRun | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>('chart');
@@ -37,8 +38,14 @@ export default function App() {
     let cancelled = false;
     const load = async () => {
       try {
-        const data = await api.bars(selected, interval, 500);
-        if (!cancelled) setBars(data);
+        const [data, sigs] = await Promise.all([
+          api.bars(selected, interval, 500),
+          api.signalsForSymbol(selected, 7).catch(() => [] as SignalRow[]),
+        ]);
+        if (!cancelled) {
+          setBars(data);
+          setSignals(sigs);
+        }
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
       }
@@ -130,7 +137,7 @@ export default function App() {
             <IndicatorPanel bars={bars} />
 
             <div className="flex-1 min-h-0">
-              <PriceChart bars={bars} />
+              <PriceChart bars={bars} signals={signals} />
             </div>
           </main>
         </div>

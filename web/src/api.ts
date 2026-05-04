@@ -60,6 +60,8 @@ export const api = {
     ),
   models: () => getJson<ModelRow[]>('/ml/models'),
   signals: (limit = 50) => getJson<SignalRow[]>(`/signals?limit=${limit}`),
+  signalsForSymbol: (symbol: string, days = 7) =>
+    getJson<SignalRow[]>(`/signals/by-symbol/${encodeURIComponent(symbol)}?days=${days}`),
   trainModels: async (days = 7, hold = 30) => {
     const res = await fetch(`${BASE}/ml/train?days=${days}&hold=${hold}`);
     if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
