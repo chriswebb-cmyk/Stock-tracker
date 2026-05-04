@@ -28,6 +28,30 @@ const SETUP_LABEL: Record<string, string> = {
   rsi_overbought_reversal: 'RSI rev',
 };
 
+const TZ = 'America/Chicago';
+
+function fmtCstTime(time: number): string {
+  const d = new Date(time * 1000);
+  return d.toLocaleString('en-US', {
+    timeZone: TZ,
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: false,
+  });
+}
+
+function fmtCstFull(time: number): string {
+  const d = new Date(time * 1000);
+  return d.toLocaleString('en-US', {
+    timeZone: TZ,
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: false,
+  }) + ' CT';
+}
+
 export function PriceChart({ bars, signals }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -47,7 +71,14 @@ export function PriceChart({ bars, signals }: Props) {
         vertLines: { color: '#1e293b' },
         horzLines: { color: '#1e293b' },
       },
-      timeScale: { timeVisible: true, secondsVisible: false },
+      timeScale: {
+        timeVisible: true,
+        secondsVisible: false,
+        tickMarkFormatter: (time: Time) => fmtCstTime(time as number),
+      },
+      localization: {
+        timeFormatter: (time: Time) => fmtCstFull(time as number),
+      },
       rightPriceScale: { borderColor: '#334155' },
     });
     candleRef.current = chart.addCandlestickSeries({
