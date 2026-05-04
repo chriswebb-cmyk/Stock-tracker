@@ -127,13 +127,15 @@ export function PriceChart({ bars, signals }: Props) {
     const ema20Vals = ema(closes, 20);
     const bbVals = bollinger(closes, 20, 2);
 
-    const lineFrom = (vals: (number | null)[]): LineData[] =>
-      bars
-        .map((b, i) => {
-          const v = vals[i];
-          return v == null ? null : { time: b.ts as UTCTimestamp, value: v };
-        })
-        .filter((x): x is LineData => x !== null);
+    const lineFrom = (vals: (number | null)[]): LineData<Time>[] => {
+      const out: LineData<Time>[] = [];
+      for (let i = 0; i < bars.length; i++) {
+        const v = vals[i];
+        const b = bars[i];
+        if (v != null && b) out.push({ time: b.ts as UTCTimestamp, value: v });
+      }
+      return out;
+    };
 
     vwapRef.current?.setData(lineFrom(vwapVals));
     ema9Ref.current?.setData(lineFrom(ema9Vals));
