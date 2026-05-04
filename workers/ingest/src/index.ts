@@ -190,30 +190,37 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
   }
 
   // For symbols Yahoo couldn't serve, try Finnhub /quote sequentially since
-  // it's rate-limited and usually only a handful of symbols.
-  for (const symbol of failedSymbols) {
-    if (!finnhub) {
-      errors += 1;
-      continue;
-    }
-    try {
-      await finnhubLimiter.take(1);
-      const result = await finnhub.quoteBar(symbol, '1min', now);
-      finnhubFallback += 1;
-      if (result) {
-        fetched.push({
-          symbol,
-          bars: [result.bar],
-          prevClose: result.quote.prevClose,
-          source: 'finnhub',
-        });
+  // it's rate-limited. Skip the fallback entirely if the Yahoo failure rate
+  // is high (>40% of the chunk) — that's a Yahoo-wide issue and trying 20+
+  // serial Finnhub calls would blow the wall-clock budget. Next chunk will
+  // try Yahoo again with a clean slate.
+  const yahooFailRate = symbols.length > 0 ? failedSymbols.length / symbols.length : 0;
+  const shouldFinnhubFallback = finnhub !== null && yahooFailRate <= 0.4;
+  if (shouldFinnhubFallback) {
+    for (const symbol of failedSymbols) {
+      try {
+        await finnhubLimiter.take(1);
+        const result = await finnhub!.quoteBar(symbol, '1min', now);
+        finnhubFallback += 1;
+        if (result) {
+          fetched.push({
+            symbol,
+            bars: [result.bar],
+            prevClose: result.quote.prevClose,
+            source: 'finnhub',
+          });
+        }
+      } catch (err) {
+        errors += 1;
+        const msg = err instanceof Error ? err.message : String(err);
+        errorText = errorText ? `${errorText}\nfinnhub ${symbol}: ${msg}` : `finnhub ${symbol}: ${msg}`;
+        if (err instanceof RateLimitError) break;
       }
-    } catch (err) {
-      errors += 1;
-      const msg = err instanceof Error ? err.message : String(err);
-      errorText = errorText ? `${errorText}\nfinnhub ${symbol}: ${msg}` : `finnhub ${symbol}: ${msg}`;
-      if (err instanceof RateLimitError) break;
     }
+  } else if (failedSymbols.length > 0) {
+    errors += failedSymbols.length;
+    const note = `skipped Finnhub fallback for ${failedSymbols.length} symbols (Yahoo failure rate too high)`;
+    errorText = errorText ? `${errorText}\n${note}` : note;
   }
 
   // Single batched bar upsert for everything we just fetched.
