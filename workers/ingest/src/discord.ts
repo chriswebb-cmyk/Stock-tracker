@@ -1,5 +1,7 @@
 import type { DetectedSignal } from '../../../shared/setups';
 
+export type DiscordSignal = DetectedSignal & { mlProbability?: number | null };
+
 const SETUP_LABEL: Record<DetectedSignal['setup'], string> = {
   vwap_reclaim_long: 'VWAP reclaim',
   vwap_reject_short: 'VWAP rejection',
@@ -14,7 +16,7 @@ const SETUP_LABEL: Record<DetectedSignal['setup'], string> = {
 const COLOR_GREEN = 0x16a34a;
 const COLOR_RED = 0xdc2626;
 
-export async function postDiscordSignal(webhookUrl: string, sig: DetectedSignal): Promise<void> {
+export async function postDiscordSignal(webhookUrl: string, sig: DiscordSignal): Promise<void> {
   const isLong = sig.direction === 'long';
   const arrow = isLong ? 'UP' : 'DOWN';
   const fields: Array<{ name: string; value: string; inline: boolean }> = [
@@ -22,14 +24,24 @@ export async function postDiscordSignal(webhookUrl: string, sig: DetectedSignal)
     { name: 'Prev close', value: sig.prevClose.toFixed(2), inline: true },
     { name: 'Day change', value: `${(sig.changePct * 100).toFixed(2)}%`, inline: true },
   ];
-  if (Number.isFinite(sig.features.rsi)) {
-    fields.push({ name: 'RSI', value: sig.features.rsi.toFixed(1), inline: true });
+  const rsi = sig.features.rsi;
+  const vwap = sig.features.vwap;
+  const atr = sig.features.atr;
+  if (typeof rsi === 'number' && Number.isFinite(rsi)) {
+    fields.push({ name: 'RSI', value: rsi.toFixed(1), inline: true });
   }
-  if (Number.isFinite(sig.features.vwap)) {
-    fields.push({ name: 'VWAP', value: sig.features.vwap.toFixed(2), inline: true });
+  if (typeof vwap === 'number' && Number.isFinite(vwap)) {
+    fields.push({ name: 'VWAP', value: vwap.toFixed(2), inline: true });
   }
-  if (Number.isFinite(sig.features.atr)) {
-    fields.push({ name: 'ATR', value: sig.features.atr.toFixed(2), inline: true });
+  if (typeof atr === 'number' && Number.isFinite(atr)) {
+    fields.push({ name: 'ATR', value: atr.toFixed(2), inline: true });
+  }
+  if (typeof sig.mlProbability === 'number' && Number.isFinite(sig.mlProbability)) {
+    fields.push({
+      name: 'ML score',
+      value: `${(sig.mlProbability * 100).toFixed(1)}%`,
+      inline: true,
+    });
   }
 
   const embed = {

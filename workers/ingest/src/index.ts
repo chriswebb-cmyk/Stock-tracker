@@ -5,13 +5,17 @@ import {
   insertSignal,
   lastSignalTs,
   listEnabledTickers,
+  loadModels,
   loadRecentBars,
   startIngestRun,
   upsertBars,
 } from './db';
 import { detectSetups } from '../../../shared/setups';
 import { postDiscordSignal } from './discord';
+import { modelFromJson, predict, type Model } from '../../../shared/ml';
+import { featuresToVector } from '../../../shared/features';
 import type { Bar } from '../../../shared/types';
+import type { SetupName } from '../../../shared/setups';
 
 export interface Env {
   DB: D1Database;
@@ -20,6 +24,9 @@ export interface Env {
   FINNHUB_REQUESTS_PER_MINUTE?: string;
   // Cooldown in seconds between identical (symbol, setup) alerts. Default 1800 (30 min).
   SIGNAL_COOLDOWN_SECONDS?: string;
+  // Minimum ML probability to send a Discord alert. Signals below this are
+  // still saved to the signals table but suppressed from Discord. Default 0.55.
+  ML_DISCORD_THRESHOLD?: string;
 }
 
 function isMarketHoursEt(d: Date): boolean {
@@ -66,6 +73,7 @@ export default {
           changePct: 0.02875,
           notes: 'Test alert from /test-discord',
           features: { rsi: 42, vwap: 122.10, atr: 0.85 },
+          mlProbability: 0.62,
         });
         return Response.json({ ok: true });
       } catch (err) {
@@ -90,10 +98,11 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
   errors: number;
   signals: number;
   notified: number;
+  suppressedByMl: number;
   barsWritten: number;
 }> {
   if (!opts.force && !isMarketHoursEt(now)) {
-    return { ran: false, symbols: 0, apiCalls: 0, yahooOk: 0, finnhubFallback: 0, errors: 0, signals: 0, notified: 0, barsWritten: 0 };
+    return { ran: false, symbols: 0, apiCalls: 0, yahooOk: 0, finnhubFallback: 0, errors: 0, signals: 0, notified: 0, suppressedByMl: 0, barsWritten: 0 };
   }
 
   const runId = await startIngestRun(env.DB);
@@ -105,12 +114,26 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
   const cooldownSec = Number(env.SIGNAL_COOLDOWN_SECONDS ?? '1800');
   const webhookUrl = env.DISCORD_WEBHOOK_URL?.trim();
 
+  const modelRows = await loadModels(env.DB);
+  const models = new Map<SetupName, Model>();
+  for (const [setup, row] of modelRows) {
+    const m = modelFromJson(setup as SetupName, row.weightsJson, row.trainedAt, {
+      sampleCount: row.sampleCount,
+      trainAccuracy: row.trainAccuracy,
+      valAccuracy: row.valAccuracy,
+      trainBaseline: row.trainBaseline,
+    });
+    if (m) models.set(setup as SetupName, m);
+  }
+  const mlThreshold = Number(env.ML_DISCORD_THRESHOLD ?? '0.55');
+
   let apiCalls = 0;
   let yahooOk = 0;
   let finnhubFallback = 0;
   let errors = 0;
   let signalsFound = 0;
   let notified = 0;
+  let suppressedByMl = 0;
   let barsWritten = 0;
   let errorText: string | null = null;
 
@@ -168,12 +191,33 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
       const last = await lastSignalTs(env.DB, sig.symbol, sig.setup);
       if (last !== null && sig.ts - last < cooldownSec) continue;
 
-      const features = JSON.stringify(sig.features);
-      await insertSignal(env.DB, sig.symbol, sig.ts, sig.setup, sig.direction, sig.notes, features);
+      let mlProbability: number | null = null;
+      const model = models.get(sig.setup);
+      if (model) {
+        mlProbability = predict(model, featuresToVector(sig.features));
+      }
+
+      const features = JSON.stringify({ ...sig.features, ml_probability: mlProbability ?? -1 });
+      await insertSignal(
+        env.DB,
+        sig.symbol,
+        sig.ts,
+        sig.setup,
+        sig.direction,
+        sig.notes,
+        features,
+        mlProbability,
+      );
+
+      const passesMl = mlProbability === null || mlProbability >= mlThreshold;
+      if (!passesMl) {
+        suppressedByMl += 1;
+        continue;
+      }
 
       if (webhookUrl) {
         try {
-          await postDiscordSignal(webhookUrl, sig);
+          await postDiscordSignal(webhookUrl, { ...sig, mlProbability });
           notified += 1;
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -195,6 +239,7 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
     errors,
     signals: signalsFound,
     notified,
+    suppressedByMl,
     barsWritten,
   };
 }

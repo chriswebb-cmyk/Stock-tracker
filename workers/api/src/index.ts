@@ -1,5 +1,8 @@
 import type { Bar, BarInterval, Ticker, IngestRun } from '../../../shared/types';
 import { backtest, combineResults, type BacktestResult, type SetupStats } from '../../../shared/backtest';
+import { trainLogReg, modelToJson, type ModelStats } from '../../../shared/ml';
+import { FEATURE_NAMES, featuresToVector } from '../../../shared/features';
+import type { SetupName } from '../../../shared/setups';
 
 export interface Env {
   DB: D1Database;
@@ -87,6 +90,18 @@ async function route(url: URL, request: Request, env: Env): Promise<unknown> {
     const includeTrades = url.searchParams.get('trades') === '1';
     const result = await runBacktest(env.DB, symbol, days, hold, cooldown);
     return includeTrades ? result : { ...result, trades: [] };
+  }
+
+  // /ml/train?days=7&hold=30 — runs backtest, trains per-setup logreg, persists.
+  if (path === '/ml/train' && (request.method === 'POST' || request.method === 'GET')) {
+    const days = clampInt(url.searchParams.get('days'), 1, 30, 7);
+    const hold = clampInt(url.searchParams.get('hold'), 1, 240, 30);
+    const cooldown = clampInt(url.searchParams.get('cooldown'), 0, 86400, 1800);
+    return trainModels(env.DB, days, hold, cooldown);
+  }
+
+  if (path === '/ml/models' && request.method === 'GET') {
+    return getModels(env.DB);
   }
 
   // /backtest-summary?days=7&hold=30 — aggregated across all enabled tickers.
@@ -270,6 +285,94 @@ async function getBacktestSummary(
     trades: totalTrades,
     bySetup: combineResults(results),
   };
+}
+
+async function trainModels(
+  db: D1Database,
+  days: number,
+  holdMinutes: number,
+  cooldownSec: number,
+): Promise<{
+  perSetup: Array<{ setup: SetupName; samples: number; trainAcc: number; valAcc: number; baseline: number }>;
+  symbols: number;
+  trades: number;
+}> {
+  const tickers = await db
+    .prepare('SELECT symbol FROM tickers WHERE enabled = 1 ORDER BY symbol')
+    .all<{ symbol: string }>();
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+
+  const bySetup = new Map<SetupName, { X: number[][]; y: number[] }>();
+  let totalTrades = 0;
+  let symbolsUsed = 0;
+
+  for (const { symbol } of tickers.results) {
+    const bars = await loadBarsSince(db, symbol, '1min', sinceTs);
+    if (bars.length < 30) continue;
+    symbolsUsed += 1;
+    const result = backtest(symbol, bars, holdMinutes, cooldownSec);
+    for (const t of result.trades) {
+      totalTrades += 1;
+      const bucket = bySetup.get(t.setup) ?? { X: [], y: [] };
+      bucket.X.push(featuresToVector(t.features));
+      bucket.y.push(t.pnlPct > 0 ? 1 : 0);
+      bySetup.set(t.setup, bucket);
+    }
+  }
+
+  const trainedAt = Math.floor(Date.now() / 1000);
+  const perSetup: Array<{ setup: SetupName; samples: number; trainAcc: number; valAcc: number; baseline: number }> = [];
+
+  for (const [setup, { X, y }] of bySetup) {
+    if (X.length < 30) continue;
+    const trained = trainLogReg(X, y);
+    const stats: ModelStats = trained.stats;
+    const json = modelToJson({
+      setup,
+      featureNames: FEATURE_NAMES,
+      means: trained.means,
+      stds: trained.stds,
+      weights: trained.weights,
+      bias: trained.bias,
+      trainedAt,
+      stats,
+    });
+    await db
+      .prepare(
+        `INSERT INTO models(setup, trained_at, sample_count, train_accuracy,
+                            val_accuracy, train_baseline, weights_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(setup) DO UPDATE SET
+           trained_at = excluded.trained_at,
+           sample_count = excluded.sample_count,
+           train_accuracy = excluded.train_accuracy,
+           val_accuracy = excluded.val_accuracy,
+           train_baseline = excluded.train_baseline,
+           weights_json = excluded.weights_json`,
+      )
+      .bind(setup, trainedAt, stats.sampleCount, stats.trainAccuracy, stats.valAccuracy, stats.trainBaseline, json)
+      .run();
+    perSetup.push({
+      setup,
+      samples: stats.sampleCount,
+      trainAcc: stats.trainAccuracy,
+      valAcc: stats.valAccuracy,
+      baseline: stats.trainBaseline,
+    });
+  }
+
+  perSetup.sort((a, b) => a.setup.localeCompare(b.setup));
+  return { perSetup, symbols: symbolsUsed, trades: totalTrades };
+}
+
+async function getModels(db: D1Database): Promise<unknown[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT setup, trained_at, sample_count, train_accuracy, val_accuracy,
+              train_baseline FROM models ORDER BY setup`,
+    )
+    .all();
+  return results;
 }
 
 async function getSignals(db: D1Database, limit: number): Promise<unknown[]> {

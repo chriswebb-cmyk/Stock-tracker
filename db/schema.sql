@@ -90,6 +90,18 @@ CREATE TABLE IF NOT EXISTS ingest_runs (
   error_text    TEXT
 );
 
+-- Per-setup logistic regression model trained on backtest results. One row
+-- per setup; retraining replaces the row.
+CREATE TABLE IF NOT EXISTS models (
+  setup           TEXT PRIMARY KEY,
+  trained_at      INTEGER NOT NULL,
+  sample_count   INTEGER NOT NULL,
+  train_accuracy  REAL NOT NULL,
+  val_accuracy    REAL NOT NULL,
+  train_baseline  REAL NOT NULL,
+  weights_json    TEXT NOT NULL  -- {featureNames, means, stds, weights, bias}
+);
+
 -- Seed the default watchlist.
 INSERT OR IGNORE INTO tickers(symbol) VALUES
   ('SPY'), ('QQQ'), ('AAPL'), ('NVDA'), ('TSLA');

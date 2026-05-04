@@ -1,6 +1,7 @@
 import type { Bar } from './types';
 import { atr, bollinger, etDayKey, isNum, rsi, vwap } from './indicators';
 import type { DetectedSignal, SetupName } from './setups';
+import { buildFeatures, type FeatureName } from './features';
 
 const ORB_MINUTES = 30;
 const SQUEEZE_LOOKBACK = 60;
@@ -18,6 +19,7 @@ export interface BacktestTrade {
   exitTs: number;
   exitPrice: number;
   pnlPct: number;
+  features: Record<FeatureName, number>;
 }
 
 export interface SetupStats {
@@ -139,9 +141,25 @@ export function backtest(
     if (exitIndex >= bars.length) return;
     const entryBar = bars[entryIndex]!;
     const exitBar = bars[exitIndex]!;
+    const dayIdx = dayIndexOf[entryIndex]!;
+    const day = days[dayIdx]!;
     const entry = entryBar.close;
     const exit = exitBar.close;
     const pnlPct = direction === 'long' ? (exit - entry) / entry : (entry - exit) / entry;
+    const lastVwap = vwapSeries[entryIndex] ?? entryBar.close;
+    const lastRsi = rsiSeries[entryIndex] ?? 50;
+    const bbBand = bbSeries[entryIndex];
+    const lastAtr = atrSeries[entryIndex] ?? 0;
+    const features = buildFeatures({
+      close: entryBar.close,
+      prevClose: day.prevClose,
+      rsi: isNum(lastRsi) ? lastRsi : 50,
+      vwap: isNum(lastVwap) ? lastVwap : entryBar.close,
+      bbLower: bbBand && isNum(bbBand.lower) ? bbBand.lower : entryBar.close,
+      bbUpper: bbBand && isNum(bbBand.upper) ? bbBand.upper : entryBar.close,
+      atr: isNum(lastAtr) ? lastAtr : 0,
+      ts: entryBar.ts,
+    });
     trades.push({
       symbol,
       setup,
@@ -151,6 +169,7 @@ export function backtest(
       exitTs: exitBar.ts,
       exitPrice: exit,
       pnlPct,
+      features,
     });
   }
 

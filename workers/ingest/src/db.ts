@@ -92,6 +92,52 @@ export async function loadRecentBars(
     .reverse();
 }
 
+export async function loadModels(db: D1Database): Promise<Map<string, {
+  setup: string;
+  weightsJson: string;
+  trainedAt: number;
+  sampleCount: number;
+  trainAccuracy: number;
+  valAccuracy: number;
+  trainBaseline: number;
+}>> {
+  const out = new Map<string, {
+    setup: string;
+    weightsJson: string;
+    trainedAt: number;
+    sampleCount: number;
+    trainAccuracy: number;
+    valAccuracy: number;
+    trainBaseline: number;
+  }>();
+  const { results } = await db
+    .prepare(
+      `SELECT setup, weights_json, trained_at, sample_count,
+              train_accuracy, val_accuracy, train_baseline FROM models`,
+    )
+    .all<{
+      setup: string;
+      weights_json: string;
+      trained_at: number;
+      sample_count: number;
+      train_accuracy: number;
+      val_accuracy: number;
+      train_baseline: number;
+    }>();
+  for (const r of results) {
+    out.set(r.setup, {
+      setup: r.setup,
+      weightsJson: r.weights_json,
+      trainedAt: r.trained_at,
+      sampleCount: r.sample_count,
+      trainAccuracy: r.train_accuracy,
+      valAccuracy: r.val_accuracy,
+      trainBaseline: r.train_baseline,
+    });
+  }
+  return out;
+}
+
 export async function lastSignalTs(
   db: D1Database,
   symbol: string,
@@ -112,13 +158,14 @@ export async function insertSignal(
   direction: 'long' | 'short',
   notes: string,
   featuresJson: string,
+  mlProbability: number | null,
 ): Promise<void> {
   await db
     .prepare(
       `INSERT INTO signals(symbol, ts, setup, direction, ml_probability, features_json, contract_pick, notes)
-       VALUES (?, ?, ?, ?, NULL, ?, NULL, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
     )
-    .bind(symbol, ts, setup, direction, featuresJson, notes)
+    .bind(symbol, ts, setup, direction, mlProbability, featuresJson, notes)
     .run();
 }
 
