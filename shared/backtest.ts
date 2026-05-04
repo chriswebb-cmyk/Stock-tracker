@@ -1,5 +1,5 @@
 import type { Bar } from './types';
-import { atr, bollinger, etDayKey, rsi, vwap, type BollingerBand } from './indicators';
+import { atr, bollinger, etDayKey, isNum, rsi, vwap } from './indicators';
 import type { DetectedSignal, SetupName } from './setups';
 
 const ORB_MINUTES = 30;
@@ -50,14 +50,11 @@ interface DayInfo {
   prevClose: number;
   orbHigh: number;
   orbLow: number;
-  orbReadyIndex: number; // first index where ORB is established
+  orbReadyIndex: number;
   brokeUp: boolean;
   brokeDown: boolean;
 }
 
-// Walks `bars` forward, simulating signals + fixed-time exits. Bars must be
-// sorted ascending and contiguous within trading days. `cooldownSec` mirrors
-// live signal dedup. `holdMinutes` is exit time relative to signal bar.
 export function backtest(
   symbol: string,
   bars: Bar[],
@@ -83,16 +80,18 @@ export function backtest(
   const atrSeries = atr(bars, 14);
   const dayKeys = bars.map((b) => etDayKey(b.ts));
 
-  // Precompute per-day metadata and per-bar lookup of "which day am I in".
   const days: DayInfo[] = [];
   let lastDay = '';
   for (let i = 0; i < bars.length; i++) {
-    if (dayKeys[i] !== lastDay) {
-      lastDay = dayKeys[i];
+    const key = dayKeys[i]!;
+    if (key !== lastDay) {
+      lastDay = key;
+      const prevBar = i > 0 ? bars[i - 1] : undefined;
+      const curBar = bars[i]!;
       days.push({
-        dayKey: lastDay,
+        dayKey: key,
         startIndex: i,
-        prevClose: i > 0 ? bars[i - 1].close : bars[i].open,
+        prevClose: prevBar?.close ?? curBar.open,
         orbHigh: -Infinity,
         orbLow: Infinity,
         orbReadyIndex: -1,
@@ -102,28 +101,26 @@ export function backtest(
     }
   }
 
-  // Compute ORB high/low for each day from first ORB_MINUTES bars.
   for (const day of days) {
     const end = Math.min(day.startIndex + ORB_MINUTES, bars.length);
     for (let i = day.startIndex; i < end; i++) {
-      if (bars[i].high > day.orbHigh) day.orbHigh = bars[i].high;
-      if (bars[i].low < day.orbLow) day.orbLow = bars[i].low;
+      const b = bars[i]!;
+      if (b.high > day.orbHigh) day.orbHigh = b.high;
+      if (b.low < day.orbLow) day.orbLow = b.low;
     }
     if (end - day.startIndex >= ORB_MINUTES) {
       day.orbReadyIndex = day.startIndex + ORB_MINUTES;
     }
   }
 
-  // Map bar index -> day metadata index.
   const dayIndexOf = new Array<number>(bars.length).fill(0);
   let di = 0;
   for (let i = 0; i < bars.length; i++) {
-    while (di + 1 < days.length && days[di + 1].startIndex <= i) di++;
+    while (di + 1 < days.length && days[di + 1]!.startIndex <= i) di++;
     dayIndexOf[i] = di;
   }
 
   const trades: BacktestTrade[] = [];
-  // Cooldown tracker: last signal ts per setup name.
   const lastSignalTs = new Map<SetupName, number>();
 
   function shouldFire(setup: SetupName, ts: number): boolean {
@@ -140,26 +137,29 @@ export function backtest(
   ): void {
     const exitIndex = entryIndex + holdMinutes;
     if (exitIndex >= bars.length) return;
-    const entry = bars[entryIndex].close;
-    const exit = bars[exitIndex].close;
+    const entryBar = bars[entryIndex]!;
+    const exitBar = bars[exitIndex]!;
+    const entry = entryBar.close;
+    const exit = exitBar.close;
     const pnlPct = direction === 'long' ? (exit - entry) / entry : (entry - exit) / entry;
     trades.push({
       symbol,
       setup,
       direction,
-      entryTs: bars[entryIndex].ts,
+      entryTs: entryBar.ts,
       entryPrice: entry,
-      exitTs: bars[exitIndex].ts,
+      exitTs: exitBar.ts,
       exitPrice: exit,
       pnlPct,
     });
   }
 
   for (let i = 1; i < bars.length; i++) {
-    const day = days[dayIndexOf[i]];
-    const ts = bars[i].ts;
-    const prev = bars[i - 1];
-    const cur = bars[i];
+    const dayIdx = dayIndexOf[i]!;
+    const day = days[dayIdx]!;
+    const cur = bars[i]!;
+    const prev = bars[i - 1]!;
+    const ts = cur.ts;
 
     const lastVwap = vwapSeries[i];
     const prevVwap = vwapSeries[i - 1];
@@ -168,11 +168,10 @@ export function backtest(
     const lastBb = bbSeries[i];
     const lastAtr = atrSeries[i];
 
-    // VWAP reclaim long
     if (
-      Number.isFinite(lastVwap) &&
-      Number.isFinite(prevVwap) &&
-      Number.isFinite(lastAtr) &&
+      isNum(lastVwap) &&
+      isNum(prevVwap) &&
+      isNum(lastAtr) &&
       prev.close < prevVwap &&
       cur.close > lastVwap &&
       cur.close - lastVwap > lastAtr * 0.1 &&
@@ -181,11 +180,10 @@ export function backtest(
       recordTrade('vwap_reclaim_long', 'long', i);
     }
 
-    // VWAP reject short
     if (
-      Number.isFinite(lastVwap) &&
-      Number.isFinite(prevVwap) &&
-      Number.isFinite(lastAtr) &&
+      isNum(lastVwap) &&
+      isNum(prevVwap) &&
+      isNum(lastAtr) &&
       prev.close > prevVwap &&
       cur.close < lastVwap &&
       lastVwap - cur.close > lastAtr * 0.1 &&
@@ -194,7 +192,6 @@ export function backtest(
       recordTrade('vwap_reject_short', 'short', i);
     }
 
-    // ORB breakout — only after orbReadyIndex, only first time per day
     if (
       day.orbReadyIndex >= 0 &&
       i >= day.orbReadyIndex &&
@@ -211,30 +208,29 @@ export function backtest(
       }
     }
 
-    // Bollinger squeeze release
-    if (i >= SQUEEZE_LOOKBACK && Number.isFinite(lastBb.width)) {
-      // Could be cached, but ~60 numbers is cheap.
+    if (i >= SQUEEZE_LOOKBACK && lastBb && isNum(lastBb.width)) {
       const widths: number[] = [];
       for (let k = i - SQUEEZE_LOOKBACK + 1; k < i; k++) {
-        const w = bbSeries[k].width;
-        if (Number.isFinite(w)) widths.push(w);
+        const w = bbSeries[k]?.width;
+        if (isNum(w)) widths.push(w);
       }
       if (widths.length >= SQUEEZE_LOOKBACK / 2) {
         widths.sort((a, b) => a - b);
         const threshold = widths[Math.floor(widths.length * SQUEEZE_PCTILE)];
-        const releaseTrigger = threshold * SQUEEZE_RELEASE_MULT;
-        if (lastBb.width >= releaseTrigger) {
-          if (cur.close > lastBb.upper && shouldFire('bb_squeeze_release_long', ts)) {
-            recordTrade('bb_squeeze_release_long', 'long', i);
-          } else if (cur.close < lastBb.lower && shouldFire('bb_squeeze_release_short', ts)) {
-            recordTrade('bb_squeeze_release_short', 'short', i);
+        if (isNum(threshold)) {
+          const releaseTrigger = threshold * SQUEEZE_RELEASE_MULT;
+          if (lastBb.width >= releaseTrigger) {
+            if (cur.close > lastBb.upper && shouldFire('bb_squeeze_release_long', ts)) {
+              recordTrade('bb_squeeze_release_long', 'long', i);
+            } else if (cur.close < lastBb.lower && shouldFire('bb_squeeze_release_short', ts)) {
+              recordTrade('bb_squeeze_release_short', 'short', i);
+            }
           }
         }
       }
     }
 
-    // RSI mean reversion
-    if (Number.isFinite(prevRsi) && Number.isFinite(lastRsi)) {
+    if (isNum(prevRsi) && isNum(lastRsi)) {
       if (
         prevRsi < RSI_OVERSOLD &&
         lastRsi > prevRsi &&
@@ -279,6 +275,9 @@ function aggregate(trades: BacktestTrade[]): SetupStats[] {
     const wins = pnls.filter((p) => p > 0).length;
     const losses = pnls.filter((p) => p <= 0).length;
     const total = pnls.reduce((s, p) => s + p, 0);
+    const median = pnls.length > 0 ? pnls[Math.floor(pnls.length / 2)]! : 0;
+    const best = pnls.length > 0 ? pnls[pnls.length - 1]! : 0;
+    const worst = pnls.length > 0 ? pnls[0]! : 0;
     out.push({
       setup,
       trades: arr.length,
@@ -286,22 +285,19 @@ function aggregate(trades: BacktestTrade[]): SetupStats[] {
       losses,
       winRate: arr.length > 0 ? wins / arr.length : 0,
       avgPnlPct: arr.length > 0 ? total / arr.length : 0,
-      medianPnlPct: pnls.length > 0 ? pnls[Math.floor(pnls.length / 2)] : 0,
-      bestPnlPct: pnls.length > 0 ? pnls[pnls.length - 1] : 0,
-      worstPnlPct: pnls.length > 0 ? pnls[0] : 0,
+      medianPnlPct: median,
+      bestPnlPct: best,
+      worstPnlPct: worst,
       totalPnlPct: total,
     });
   }
-  // Stable sort by setup name for predictable display order.
   out.sort((a, b) => a.setup.localeCompare(b.setup));
   return out;
 }
 
-// Aggregate stats across multiple per-symbol BacktestResults.
 export function combineResults(results: BacktestResult[]): SetupStats[] {
   const allTrades = results.flatMap((r) => r.trades);
   return aggregate(allTrades);
 }
 
-// Re-exposed so the API worker can call it without an import dance.
 export type { DetectedSignal };

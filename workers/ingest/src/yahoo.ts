@@ -92,16 +92,17 @@ export class YahooClient {
     let dayOpen: number | null = null;
     let lastClose: number | null = null;
     for (let i = 0; i < ts.length; i++) {
+      const t = ts[i];
       const o = opens[i];
       const h = highs[i];
       const l = lows[i];
       const c = closes[i];
       const v = volumes[i] ?? 0;
-      if (o == null || h == null || l == null || c == null) continue;
+      if (t == null || o == null || h == null || l == null || c == null) continue;
       bars.push({
         symbol,
         interval,
-        ts: ts[i],
+        ts: t,
         open: o,
         high: h,
         low: l,
