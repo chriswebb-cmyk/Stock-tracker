@@ -56,6 +56,7 @@ export function PriceChart({ bars, signals }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+  const lastSymbolRef = useRef<string | undefined>(undefined);
   const vwapRef = useRef<ISeriesApi<'Line'> | null>(null);
   const ema9Ref = useRef<ISeriesApi<'Line'> | null>(null);
   const ema20Ref = useRef<ISeriesApi<'Line'> | null>(null);
@@ -189,7 +190,13 @@ export function PriceChart({ bars, signals }: Props) {
       }));
     candle.setMarkers(markers);
 
-    chartRef.current?.timeScale().fitContent();
+    // Only reset zoom/pan when switching to a different ticker; otherwise the
+    // user's current view should stay put across the 30-second auto-refresh.
+    const sym = bars[0]?.symbol;
+    if (sym && sym !== lastSymbolRef.current) {
+      lastSymbolRef.current = sym;
+      chartRef.current?.timeScale().fitContent();
+    }
   }, [bars, signals]);
 
   return <div ref={containerRef} className="w-full h-full" />;
