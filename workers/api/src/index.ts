@@ -1,4 +1,5 @@
 import type { Bar, BarInterval, Ticker, IngestRun } from '../../../shared/types';
+import { backtest, combineResults, type BacktestResult, type SetupStats } from '../../../shared/backtest';
 
 export interface Env {
   DB: D1Database;
@@ -74,6 +75,26 @@ async function route(url: URL, request: Request, env: Env): Promise<unknown> {
   if (path === '/signals' && request.method === 'GET') {
     const limit = clampInt(url.searchParams.get('limit'), 1, 200, 50);
     return getSignals(env.DB, limit);
+  }
+
+  // /backtest/:symbol?days=7&hold=30&cooldown=1800
+  const btMatch = path.match(/^\/backtest\/([A-Za-z.\-]+)$/);
+  if (btMatch && request.method === 'GET') {
+    const symbol = btMatch[1].toUpperCase();
+    const days = clampInt(url.searchParams.get('days'), 1, 30, 7);
+    const hold = clampInt(url.searchParams.get('hold'), 1, 240, 30);
+    const cooldown = clampInt(url.searchParams.get('cooldown'), 0, 86400, 1800);
+    const includeTrades = url.searchParams.get('trades') === '1';
+    const result = await runBacktest(env.DB, symbol, days, hold, cooldown);
+    return includeTrades ? result : { ...result, trades: [] };
+  }
+
+  // /backtest-summary?days=7&hold=30 — aggregated across all enabled tickers.
+  if (path === '/backtest-summary' && request.method === 'GET') {
+    const days = clampInt(url.searchParams.get('days'), 1, 30, 7);
+    const hold = clampInt(url.searchParams.get('hold'), 1, 240, 30);
+    const cooldown = clampInt(url.searchParams.get('cooldown'), 0, 86400, 1800);
+    return getBacktestSummary(env.DB, days, hold, cooldown);
   }
 
   throw new HttpError(404, 'not found');
@@ -195,6 +216,60 @@ async function getIngestRuns(db: D1Database, limit: number): Promise<IngestRun[]
     errors: r.errors,
     errorText: r.error_text,
   }));
+}
+
+async function loadBarsSince(
+  db: D1Database,
+  symbol: string,
+  interval: BarInterval,
+  sinceTs: number,
+): Promise<Bar[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT symbol, interval, ts, open, high, low, close, volume
+         FROM bars
+        WHERE symbol = ? AND interval = ? AND ts >= ?
+        ORDER BY ts ASC`,
+    )
+    .bind(symbol, interval, sinceTs)
+    .all<Bar>();
+  return results;
+}
+
+async function runBacktest(
+  db: D1Database,
+  symbol: string,
+  days: number,
+  holdMinutes: number,
+  cooldownSec: number,
+): Promise<BacktestResult> {
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+  const bars = await loadBarsSince(db, symbol, '1min', sinceTs);
+  return backtest(symbol, bars, holdMinutes, cooldownSec);
+}
+
+async function getBacktestSummary(
+  db: D1Database,
+  days: number,
+  holdMinutes: number,
+  cooldownSec: number,
+): Promise<{ symbols: number; trades: number; bySetup: SetupStats[] }> {
+  const tickers = await db
+    .prepare('SELECT symbol FROM tickers WHERE enabled = 1 ORDER BY symbol')
+    .all<{ symbol: string }>();
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+  const results: BacktestResult[] = [];
+  for (const { symbol } of tickers.results) {
+    const bars = await loadBarsSince(db, symbol, '1min', sinceTs);
+    if (bars.length < 30) continue;
+    results.push(backtest(symbol, bars, holdMinutes, cooldownSec));
+  }
+  const totalTrades = results.reduce((sum, r) => sum + r.trades.length, 0);
+  return {
+    symbols: results.length,
+    trades: totalTrades,
+    bySetup: combineResults(results),
+  };
 }
 
 async function getSignals(db: D1Database, limit: number): Promise<unknown[]> {

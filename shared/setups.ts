@@ -1,4 +1,4 @@
-import type { Bar } from '../../../shared/types';
+import type { Bar } from './types';
 import { atr, bollinger, etDayKey, rsi, vwap } from './indicators';
 
 export type SetupName =

@@ -1,4 +1,4 @@
-import type { Bar } from '../../../shared/types';
+import type { Bar } from './types';
 
 // Exponential moving average. Returns one value per input close, with the
 // first (period - 1) entries set to NaN so indexes line up with closes.

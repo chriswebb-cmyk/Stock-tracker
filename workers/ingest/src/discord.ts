@@ -1,4 +1,4 @@
-import type { DetectedSignal } from './setups';
+import type { DetectedSignal } from '../../../shared/setups';
 
 const SETUP_LABEL: Record<DetectedSignal['setup'], string> = {
   vwap_reclaim_long: 'VWAP reclaim',

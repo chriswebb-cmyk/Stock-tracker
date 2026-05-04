@@ -9,7 +9,7 @@ import {
   startIngestRun,
   upsertBars,
 } from './db';
-import { detectSetups } from './setups';
+import { detectSetups } from '../../../shared/setups';
 import { postDiscordSignal } from './discord';
 import type { Bar } from '../../../shared/types';
 
