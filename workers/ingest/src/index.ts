@@ -1,17 +1,16 @@
 import { FinnhubClient, RateLimiter, RateLimitError } from './finnhub';
-import { YahooClient, YahooError } from './yahoo';
+import { YahooClient } from './yahoo';
 import {
+  batchInsertSignals,
   finishIngestRun,
-  insertSignal,
-  lastSignalTs,
   listEnabledTickers,
   loadModels,
-  loadRecentBars,
+  recentSignalCooldown,
   startIngestRun,
   upsertBars,
 } from './db';
 import { detectSetups } from '../../../shared/setups';
-import { postDiscordSignal } from './discord';
+import { postDiscordSignals, type DiscordSignal } from './discord';
 import { modelFromJson, predict, type Model } from '../../../shared/ml';
 import { featuresToVector } from '../../../shared/features';
 import type { Bar } from '../../../shared/types';
@@ -22,14 +21,13 @@ export interface Env {
   FINNHUB_API_KEY: string;
   DISCORD_WEBHOOK_URL?: string;
   FINNHUB_REQUESTS_PER_MINUTE?: string;
-  // Cooldown in seconds between identical (symbol, setup) alerts. Default 1800 (30 min).
   SIGNAL_COOLDOWN_SECONDS?: string;
-  // Minimum ML probability to send a Discord alert. Signals below this are
-  // still saved to the signals table but suppressed from Discord. Default 0.60.
   ML_DISCORD_THRESHOLD?: string;
-  // Comma-separated list of setup names that should never fire. Useful for
-  // turning off setups whose backtest shows no edge.
   DISABLED_SETUPS?: string;
+  // Number of cron buckets to split the watchlist across. With CHUNKS=2 each
+  // symbol is polled every 2 minutes; default keeps free-tier subrequests
+  // within budget for ~50 symbols.
+  CHUNKS?: string;
 }
 
 function isMarketHoursEt(d: Date): boolean {
@@ -50,7 +48,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === '/run') {
-      const result = await runIngest(env, new Date(), { force: true });
+      const result = await runIngest(env, new Date(), { force: true, allChunks: true });
       return Response.json(result);
     }
     if (url.pathname === '/backfill') {
@@ -66,7 +64,7 @@ export default {
         return Response.json({ ok: false, error: 'DISCORD_WEBHOOK_URL not set' }, { status: 400 });
       }
       try {
-        await postDiscordSignal(env.DISCORD_WEBHOOK_URL, {
+        await postDiscordSignals(env.DISCORD_WEBHOOK_URL, [{
           symbol: 'TEST',
           ts: Math.floor(Date.now() / 1000),
           setup: 'vwap_reclaim_long',
@@ -77,7 +75,7 @@ export default {
           notes: 'Test alert from /test-discord',
           features: { rsi: 42, vwap: 122.10, atr: 0.85 },
           mlProbability: 0.62,
-        });
+        }]);
         return Response.json({ ok: true });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -90,12 +88,14 @@ export default {
 
 interface RunOptions {
   force?: boolean;
+  allChunks?: boolean;
 }
 
 async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
   ran: boolean;
+  chunk: number;
+  chunkSize: number;
   symbols: number;
-  apiCalls: number;
   yahooOk: number;
   finnhubFallback: number;
   errors: number;
@@ -105,18 +105,32 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
   barsWritten: number;
 }> {
   if (!opts.force && !isMarketHoursEt(now)) {
-    return { ran: false, symbols: 0, apiCalls: 0, yahooOk: 0, finnhubFallback: 0, errors: 0, signals: 0, notified: 0, suppressedByMl: 0, barsWritten: 0 };
+    return { ran: false, chunk: 0, chunkSize: 0, symbols: 0, yahooOk: 0, finnhubFallback: 0, errors: 0, signals: 0, notified: 0, suppressedByMl: 0, barsWritten: 0 };
   }
 
-  const runId = await startIngestRun(env.DB);
   const tickers = await listEnabledTickers(env.DB);
+  const numChunks = Math.max(1, Number(env.CHUNKS ?? '2'));
+  // Pick chunk by minute parity / mod so successive cron firings rotate.
+  const chunkIdx = opts.allChunks ? -1 : Math.floor(now.getTime() / 60_000) % numChunks;
+  const symbols = opts.allChunks
+    ? tickers
+    : tickers.filter((_, i) => i % numChunks === chunkIdx);
+
+  const runId = await startIngestRun(env.DB);
   const yahoo = new YahooClient();
   const finnhub = env.FINNHUB_API_KEY ? new FinnhubClient(env.FINNHUB_API_KEY) : null;
-  const finnhubRpm = Number(env.FINNHUB_REQUESTS_PER_MINUTE ?? '60');
-  const finnhubLimiter = new RateLimiter(finnhubRpm);
+  const finnhubLimiter = new RateLimiter(Number(env.FINNHUB_REQUESTS_PER_MINUTE ?? '60'));
   const cooldownSec = Number(env.SIGNAL_COOLDOWN_SECONDS ?? '1800');
   const webhookUrl = env.DISCORD_WEBHOOK_URL?.trim();
+  const mlThreshold = Number(env.ML_DISCORD_THRESHOLD ?? '0.60');
+  const disabled = new Set(
+    (env.DISABLED_SETUPS ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
 
+  // Load models + cooldown map up-front so we don't hit D1 inside the inner loop.
   const modelRows = await loadModels(env.DB);
   const models = new Map<SetupName, Model>();
   for (const [setup, row] of modelRows) {
@@ -128,78 +142,103 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
     });
     if (m) models.set(setup as SetupName, m);
   }
-  const mlThreshold = Number(env.ML_DISCORD_THRESHOLD ?? '0.60');
-  const disabled = new Set(
-    (env.DISABLED_SETUPS ?? '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0),
+  const cooldownLookup = await recentSignalCooldown(
+    env.DB,
+    Math.floor(now.getTime() / 1000) - cooldownSec,
   );
 
-  let apiCalls = 0;
   let yahooOk = 0;
   let finnhubFallback = 0;
   let errors = 0;
   let signalsFound = 0;
-  let notified = 0;
   let suppressedByMl = 0;
-  let barsWritten = 0;
   let errorText: string | null = null;
 
-  for (const symbol of tickers) {
-    let prevClose: number | null = null;
-    let newBars: Bar[] = [];
-
-    try {
+  // Fan out Yahoo fetches concurrently. Each fetch is one subrequest; with
+  // chunked symbol lists we stay well under the 50-per-invocation cap.
+  type FetchOk = {
+    symbol: string;
+    bars: Bar[];
+    prevClose: number | null;
+    source: 'yahoo' | 'finnhub';
+  };
+  type FetchFail = { symbol: string; err: unknown };
+  const settled = await Promise.allSettled(
+    symbols.map(async (symbol): Promise<FetchOk> => {
       const result = await yahoo.latest(symbol, '1min');
-      apiCalls += 1;
+      return { symbol, bars: result.bars, prevClose: result.prevClose, source: 'yahoo' };
+    }),
+  );
+
+  const fetched: FetchOk[] = [];
+  const failedSymbols: string[] = [];
+  for (let i = 0; i < settled.length; i++) {
+    const r = settled[i]!;
+    const symbol = symbols[i]!;
+    if (r.status === 'fulfilled') {
       yahooOk += 1;
-      if (result.bars.length > 0) {
-        await upsertBars(env.DB, result.bars);
-        barsWritten += result.bars.length;
-        newBars = result.bars;
-        prevClose = result.prevClose;
+      fetched.push(r.value);
+    } else {
+      const msg = r.reason instanceof Error ? r.reason.message : String(r.reason);
+      errorText = errorText ? `${errorText}\nyahoo ${symbol}: ${msg}` : `yahoo ${symbol}: ${msg}`;
+      failedSymbols.push(symbol);
+    }
+  }
+
+  // For symbols Yahoo couldn't serve, try Finnhub /quote sequentially since
+  // it's rate-limited and usually only a handful of symbols.
+  for (const symbol of failedSymbols) {
+    if (!finnhub) {
+      errors += 1;
+      continue;
+    }
+    try {
+      await finnhubLimiter.take(1);
+      const result = await finnhub.quoteBar(symbol, '1min', now);
+      finnhubFallback += 1;
+      if (result) {
+        fetched.push({
+          symbol,
+          bars: [result.bar],
+          prevClose: result.quote.prevClose,
+          source: 'finnhub',
+        });
       }
     } catch (err) {
+      errors += 1;
       const msg = err instanceof Error ? err.message : String(err);
-      errorText = errorText ? `${errorText}\nyahoo ${symbol}: ${msg}` : `yahoo ${symbol}: ${msg}`;
-
-      if (finnhub) {
-        try {
-          await finnhubLimiter.take(1);
-          const result = await finnhub.quoteBar(symbol, '1min', now);
-          apiCalls += 1;
-          finnhubFallback += 1;
-          if (result) {
-            await upsertBars(env.DB, [result.bar]);
-            barsWritten += 1;
-            newBars = [result.bar];
-            prevClose = result.quote.prevClose;
-          }
-        } catch (fbErr) {
-          errors += 1;
-          const fbMsg = fbErr instanceof Error ? fbErr.message : String(fbErr);
-          errorText = errorText ? `${errorText}\nfinnhub ${symbol}: ${fbMsg}` : `finnhub ${symbol}: ${fbMsg}`;
-          if (fbErr instanceof RateLimitError) break;
-        }
-      } else {
-        errors += 1;
-      }
+      errorText = errorText ? `${errorText}\nfinnhub ${symbol}: ${msg}` : `finnhub ${symbol}: ${msg}`;
+      if (err instanceof RateLimitError) break;
     }
+  }
 
-    if (newBars.length === 0 || prevClose === null) continue;
+  // Single batched bar upsert for everything we just fetched.
+  const allBars: Bar[] = fetched.flatMap((f) => f.bars);
+  if (allBars.length > 0) {
+    await upsertBars(env.DB, allBars);
+  }
 
-    // Setup detection needs more history than the latest fetch usually returns.
-    // Pull the most recent ~200 bars from D1 (now including what we just wrote).
-    const historyBars = await loadRecentBars(env.DB, symbol, '1min', 200);
-    if (historyBars.length < 30) continue;
+  // In-memory setup detection per symbol.
+  const signalsToFire: DiscordSignal[] = [];
+  const signalsToInsert: Array<{
+    symbol: string;
+    ts: number;
+    setup: string;
+    direction: 'long' | 'short';
+    notes: string;
+    featuresJson: string;
+    mlProbability: number | null;
+  }> = [];
 
-    const detected = detectSetups(symbol, historyBars, prevClose);
+  for (const f of fetched) {
+    if (f.bars.length < 30 || f.prevClose === null) continue;
+    const detected = detectSetups(f.symbol, f.bars, f.prevClose);
     for (const sig of detected) {
       if (disabled.has(sig.setup)) continue;
       signalsFound += 1;
-      const last = await lastSignalTs(env.DB, sig.symbol, sig.setup);
-      if (last !== null && sig.ts - last < cooldownSec) continue;
+      const cdKey = `${sig.symbol}|${sig.setup}`;
+      const lastTs = cooldownLookup.get(cdKey);
+      if (lastTs !== undefined && sig.ts - lastTs < cooldownSec) continue;
 
       let mlProbability: number | null = null;
       const model = models.get(sig.setup);
@@ -207,50 +246,56 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
         mlProbability = predict(model, featuresToVector(sig.features));
       }
 
-      const features = JSON.stringify({ ...sig.features, ml_probability: mlProbability ?? -1 });
-      await insertSignal(
-        env.DB,
-        sig.symbol,
-        sig.ts,
-        sig.setup,
-        sig.direction,
-        sig.notes,
-        features,
+      signalsToInsert.push({
+        symbol: sig.symbol,
+        ts: sig.ts,
+        setup: sig.setup,
+        direction: sig.direction,
+        notes: sig.notes,
+        featuresJson: JSON.stringify({ ...sig.features, ml_probability: mlProbability ?? -1 }),
         mlProbability,
-      );
+      });
+
+      // Update cooldown map so subsequent setups in the same run respect it.
+      cooldownLookup.set(cdKey, sig.ts);
 
       const passesMl = mlProbability === null || mlProbability >= mlThreshold;
       if (!passesMl) {
         suppressedByMl += 1;
         continue;
       }
-
-      if (webhookUrl) {
-        try {
-          await postDiscordSignal(webhookUrl, { ...sig, mlProbability });
-          notified += 1;
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          errorText = errorText
-            ? `${errorText}\n${symbol} discord: ${msg}`
-            : `${symbol} discord: ${msg}`;
-        }
-      }
+      signalsToFire.push({ ...sig, mlProbability });
     }
   }
 
-  await finishIngestRun(env.DB, runId, tickers.length, apiCalls, errors, errorText);
+  if (signalsToInsert.length > 0) {
+    await batchInsertSignals(env.DB, signalsToInsert);
+  }
+
+  let notified = 0;
+  if (webhookUrl && signalsToFire.length > 0) {
+    try {
+      await postDiscordSignals(webhookUrl, signalsToFire);
+      notified = signalsToFire.length;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      errorText = errorText ? `${errorText}\ndiscord: ${msg}` : `discord: ${msg}`;
+    }
+  }
+
+  await finishIngestRun(env.DB, runId, symbols.length, yahooOk + finnhubFallback, errors, errorText);
   return {
     ran: true,
-    symbols: tickers.length,
-    apiCalls,
+    chunk: chunkIdx,
+    chunkSize: symbols.length,
+    symbols: symbols.length,
     yahooOk,
     finnhubFallback,
     errors,
     signals: signalsFound,
     notified,
     suppressedByMl,
-    barsWritten,
+    barsWritten: allBars.length,
   };
 }
 
@@ -277,10 +322,6 @@ async function runBackfill(env: Env, days: number): Promise<{
     } catch (err) {
       errors += 1;
       const msg = err instanceof Error ? err.message : String(err);
-      if (err instanceof YahooError && /rate|429/i.test(msg)) {
-        errorText = errorText ? `${errorText}\n${symbol}: ${msg} (aborting)` : `${symbol}: ${msg} (aborting)`;
-        break;
-      }
       errorText = errorText ? `${errorText}\n${symbol}: ${msg}` : `${symbol}: ${msg}`;
     }
   }

@@ -2,21 +2,25 @@ import type { DetectedSignal } from '../../../shared/setups';
 
 export type DiscordSignal = DetectedSignal & { mlProbability?: number | null };
 
-const SETUP_LABEL: Record<DetectedSignal['setup'], string> = {
-  vwap_reclaim_long: 'VWAP reclaim',
-  vwap_reject_short: 'VWAP rejection',
-  orb_breakout_long: 'Opening range breakout',
-  orb_breakdown_short: 'Opening range breakdown',
-  bb_squeeze_release_long: 'Bollinger squeeze (up)',
-  bb_squeeze_release_short: 'Bollinger squeeze (down)',
-  rsi_oversold_reversal: 'RSI oversold reversal',
-  rsi_overbought_reversal: 'RSI overbought reversal',
-};
+export async function postDiscordSignals(webhookUrl: string, sigs: DiscordSignal[]): Promise<void> {
+  if (sigs.length === 0) return;
+  // Discord webhooks accept up to 10 embeds per message; chunk if needed.
+  for (let i = 0; i < sigs.length; i += 10) {
+    const chunk = sigs.slice(i, i + 10);
+    const embeds = chunk.map(buildEmbed);
+    const res = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ embeds }),
+    });
+    if (!res.ok && res.status !== 204) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Discord webhook failed: ${res.status} ${body.slice(0, 200)}`);
+    }
+  }
+}
 
-const COLOR_GREEN = 0x16a34a;
-const COLOR_RED = 0xdc2626;
-
-export async function postDiscordSignal(webhookUrl: string, sig: DiscordSignal): Promise<void> {
+function buildEmbed(sig: DiscordSignal) {
   const isLong = sig.direction === 'long';
   const arrow = isLong ? 'UP' : 'DOWN';
   const fields: Array<{ name: string; value: string; inline: boolean }> = [
@@ -43,22 +47,29 @@ export async function postDiscordSignal(webhookUrl: string, sig: DiscordSignal):
       inline: true,
     });
   }
-
-  const embed = {
+  return {
     title: `${sig.symbol} — ${SETUP_LABEL[sig.setup]} (${arrow})`,
     description: sig.notes,
     color: isLong ? COLOR_GREEN : COLOR_RED,
     fields,
     timestamp: new Date(sig.ts * 1000).toISOString(),
   };
+}
 
-  const res = await fetch(webhookUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ embeds: [embed] }),
-  });
-  if (!res.ok && res.status !== 204) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`Discord webhook failed: ${res.status} ${body.slice(0, 200)}`);
-  }
+const SETUP_LABEL: Record<DetectedSignal['setup'], string> = {
+  vwap_reclaim_long: 'VWAP reclaim',
+  vwap_reject_short: 'VWAP rejection',
+  orb_breakout_long: 'Opening range breakout',
+  orb_breakdown_short: 'Opening range breakdown',
+  bb_squeeze_release_long: 'Bollinger squeeze (up)',
+  bb_squeeze_release_short: 'Bollinger squeeze (down)',
+  rsi_oversold_reversal: 'RSI oversold reversal',
+  rsi_overbought_reversal: 'RSI overbought reversal',
+};
+
+const COLOR_GREEN = 0x16a34a;
+const COLOR_RED = 0xdc2626;
+
+export async function postDiscordSignal(webhookUrl: string, sig: DiscordSignal): Promise<void> {
+  await postDiscordSignals(webhookUrl, [sig]);
 }

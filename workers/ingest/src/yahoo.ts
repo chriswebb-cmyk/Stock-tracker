@@ -121,8 +121,9 @@ export class YahooClient {
     return { bars, prevClose, current, dayHigh, dayLow, dayOpen };
   }
 
-  // Convenience: pull today's 1-min bars + meta.
+  // Convenience: pull recent bars + meta. range=2d gives ~780 1-min bars,
+  // plenty of warmup for any indicator without needing a separate D1 query.
   latest(symbol: string, interval: BarInterval = '1min'): Promise<YahooFetchResult> {
-    return this.chart(symbol, interval, '1d');
+    return this.chart(symbol, interval, '2d');
   }
 }

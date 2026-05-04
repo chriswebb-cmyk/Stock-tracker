@@ -138,6 +138,48 @@ export async function loadModels(db: D1Database): Promise<Map<string, {
   return out;
 }
 
+export async function recentSignalCooldown(
+  db: D1Database,
+  sinceTs: number,
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  const { results } = await db
+    .prepare(
+      `SELECT symbol, setup, MAX(ts) as ts
+         FROM signals
+        WHERE ts >= ?
+        GROUP BY symbol, setup`,
+    )
+    .bind(sinceTs)
+    .all<{ symbol: string; setup: string; ts: number }>();
+  for (const r of results) out.set(`${r.symbol}|${r.setup}`, r.ts);
+  return out;
+}
+
+export async function batchInsertSignals(
+  db: D1Database,
+  rows: Array<{
+    symbol: string;
+    ts: number;
+    setup: string;
+    direction: 'long' | 'short';
+    notes: string;
+    featuresJson: string;
+    mlProbability: number | null;
+  }>,
+): Promise<void> {
+  if (rows.length === 0) return;
+  const stmt = db.prepare(
+    `INSERT INTO signals(symbol, ts, setup, direction, ml_probability,
+                         features_json, contract_pick, notes)
+     VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
+  );
+  const batch = rows.map((r) =>
+    stmt.bind(r.symbol, r.ts, r.setup, r.direction, r.mlProbability, r.featuresJson, r.notes),
+  );
+  await db.batch(batch);
+}
+
 export async function lastSignalTs(
   db: D1Database,
   symbol: string,
