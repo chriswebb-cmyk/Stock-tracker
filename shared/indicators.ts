@@ -61,19 +61,35 @@ export function bollinger(closes: number[], period = 20, mult = 2): BollingerBan
     width: NaN,
   }));
   if (closes.length < period) return out;
-  for (let i = period - 1; i < closes.length; i++) {
-    let sum = 0;
-    for (let j = i - period + 1; j <= i; j++) sum += closes[j]!;
+  // Running sum + running sum of squares so each step is O(1) instead of O(period).
+  let sum = 0;
+  let sumSq = 0;
+  for (let i = 0; i < period; i++) {
+    const v = closes[i]!;
+    sum += v;
+    sumSq += v * v;
+  }
+  const writeBand = (i: number) => {
     const mean = sum / period;
-    let varSum = 0;
-    for (let j = i - period + 1; j <= i; j++) {
-      const d = closes[j]! - mean;
-      varSum += d * d;
-    }
-    const sd = Math.sqrt(varSum / period);
+    // var = E[X^2] - E[X]^2; clamp to 0 to absorb fp noise.
+    const variance = Math.max(0, sumSq / period - mean * mean);
+    const sd = Math.sqrt(variance);
     const upper = mean + mult * sd;
     const lower = mean - mult * sd;
-    out[i] = { middle: mean, upper, lower, width: mean === 0 ? 0 : (upper - lower) / mean };
+    out[i] = {
+      middle: mean,
+      upper,
+      lower,
+      width: mean === 0 ? 0 : (upper - lower) / mean,
+    };
+  };
+  writeBand(period - 1);
+  for (let i = period; i < closes.length; i++) {
+    const incoming = closes[i]!;
+    const outgoing = closes[i - period]!;
+    sum += incoming - outgoing;
+    sumSq += incoming * incoming - outgoing * outgoing;
+    writeBand(i);
   }
   return out;
 }

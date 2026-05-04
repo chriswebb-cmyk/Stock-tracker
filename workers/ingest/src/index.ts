@@ -289,6 +289,7 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
     errors += 1;
     const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
     errorText = errorText ? `${errorText}\nfatal: ${msg}` : `fatal: ${msg}`;
+    console.error('runIngest fatal', msg);
   } finally {
     try {
       await finishIngestRun(env.DB, runId, symbols.length, yahooOk + finnhubFallback, errors, errorText);
