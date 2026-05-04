@@ -27,6 +27,19 @@ interface QuoteResponse {
   t: number;  // unix seconds
 }
 
+export interface Quote {
+  current: number;
+  dayOpen: number;
+  dayHigh: number;
+  dayLow: number;
+  prevClose: number;
+}
+
+export interface QuoteResult {
+  bar: Bar;
+  quote: Quote;
+}
+
 export class FinnhubClient {
   constructor(private readonly apiKey: string) {}
 
@@ -49,19 +62,28 @@ export class FinnhubClient {
   // Free tier doesn't expose intraday candles, so we synthesize a 1-minute bar
   // from the realtime quote on each poll. open/high/low reflect the day so far,
   // close is the current price. Volume isn't available on /quote and is set to 0.
-  async quoteBar(symbol: string, interval: BarInterval, now: Date): Promise<Bar | null> {
+  async quoteBar(symbol: string, interval: BarInterval, now: Date): Promise<QuoteResult | null> {
     const q = await this.get<QuoteResponse>('/quote', { symbol });
     if (!q || q.c === 0 || q.t === 0) return null;
     const ts = Math.floor(now.getTime() / 60_000) * 60;
     return {
-      symbol,
-      interval,
-      ts,
-      open: q.o,
-      high: q.h,
-      low: q.l,
-      close: q.c,
-      volume: 0,
+      bar: {
+        symbol,
+        interval,
+        ts,
+        open: q.o,
+        high: q.h,
+        low: q.l,
+        close: q.c,
+        volume: 0,
+      },
+      quote: {
+        current: q.c,
+        dayOpen: q.o,
+        dayHigh: q.h,
+        dayLow: q.l,
+        prevClose: q.pc,
+      },
     };
   }
 }

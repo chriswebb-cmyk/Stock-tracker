@@ -1,16 +1,24 @@
 import { FinnhubClient, RateLimiter, RateLimitError } from './finnhub';
 import {
   finishIngestRun,
+  insertSignal,
+  lastSignalTs,
   listEnabledTickers,
   startIngestRun,
   upsertBars,
 } from './db';
+import { detectSignals } from './signals';
+import { postDiscordSignal } from './discord';
 
 export interface Env {
   DB: D1Database;
   FINNHUB_API_KEY: string;
+  // Optional. If set, signals are POSTed to this Discord webhook URL.
+  DISCORD_WEBHOOK_URL?: string;
   // Requests per minute available on your Finnhub plan. Defaults to 60 (free tier).
   FINNHUB_REQUESTS_PER_MINUTE?: string;
+  // Cooldown in seconds between identical (symbol, setup) alerts. Default 1800 (30 min).
+  SIGNAL_COOLDOWN_SECONDS?: string;
 }
 
 // US market hours in ET: 09:30 - 16:00. The cron triggers every minute, but
@@ -53,9 +61,11 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
   symbols: number;
   apiCalls: number;
   errors: number;
+  signals: number;
+  notified: number;
 }> {
   if (!opts.force && !isMarketHoursEt(now)) {
-    return { ran: false, symbols: 0, apiCalls: 0, errors: 0 };
+    return { ran: false, symbols: 0, apiCalls: 0, errors: 0, signals: 0, notified: 0 };
   }
   if (!env.FINNHUB_API_KEY) {
     throw new Error('FINNHUB_API_KEY is not set');
@@ -66,18 +76,51 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
   const client = new FinnhubClient(env.FINNHUB_API_KEY);
   const rpm = Number(env.FINNHUB_REQUESTS_PER_MINUTE ?? '60');
   const limiter = new RateLimiter(rpm);
+  const cooldownSec = Number(env.SIGNAL_COOLDOWN_SECONDS ?? '1800');
+  const webhookUrl = env.DISCORD_WEBHOOK_URL?.trim();
 
   let apiCalls = 0;
   let errors = 0;
+  let signalsFound = 0;
+  let notified = 0;
   let errorText: string | null = null;
 
   for (const symbol of tickers) {
     try {
       await limiter.take(1);
-      const bar = await client.quoteBar(symbol, '1min', now);
+      const result = await client.quoteBar(symbol, '1min', now);
       apiCalls += 1;
-      if (bar) {
-        await upsertBars(env.DB, [bar]);
+      if (!result) continue;
+
+      await upsertBars(env.DB, [result.bar]);
+
+      const detected = detectSignals(symbol, result.bar.ts, result.quote);
+      for (const sig of detected) {
+        signalsFound += 1;
+        const last = await lastSignalTs(env.DB, sig.symbol, sig.setup);
+        if (last !== null && sig.ts - last < cooldownSec) continue;
+
+        const features = JSON.stringify({
+          price: sig.price,
+          prev_close: sig.prevClose,
+          change_pct: sig.changePct,
+          day_high: result.quote.dayHigh,
+          day_low: result.quote.dayLow,
+          day_open: result.quote.dayOpen,
+        });
+        await insertSignal(env.DB, sig.symbol, sig.ts, sig.setup, sig.direction, sig.notes, features);
+
+        if (webhookUrl) {
+          try {
+            await postDiscordSignal(webhookUrl, sig);
+            notified += 1;
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            errorText = errorText
+              ? `${errorText}\n${symbol} discord: ${msg}`
+              : `${symbol} discord: ${msg}`;
+          }
+        }
       }
     } catch (err) {
       errors += 1;
@@ -88,5 +131,5 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
   }
 
   await finishIngestRun(env.DB, runId, tickers.length, apiCalls, errors, errorText);
-  return { ran: true, symbols: tickers.length, apiCalls, errors };
+  return { ran: true, symbols: tickers.length, apiCalls, errors, signals: signalsFound, notified };
 }

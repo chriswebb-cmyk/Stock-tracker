@@ -53,6 +53,36 @@ export async function insertOptionsSnapshot(db: D1Database, contracts: OptionCon
   return contracts.length;
 }
 
+export async function lastSignalTs(
+  db: D1Database,
+  symbol: string,
+  setup: string,
+): Promise<number | null> {
+  const row = await db
+    .prepare('SELECT ts FROM signals WHERE symbol = ? AND setup = ? ORDER BY ts DESC LIMIT 1')
+    .bind(symbol, setup)
+    .first<{ ts: number }>();
+  return row ? row.ts : null;
+}
+
+export async function insertSignal(
+  db: D1Database,
+  symbol: string,
+  ts: number,
+  setup: string,
+  direction: 'long' | 'short',
+  notes: string,
+  featuresJson: string,
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO signals(symbol, ts, setup, direction, ml_probability, features_json, contract_pick, notes)
+       VALUES (?, ?, ?, ?, NULL, ?, NULL, ?)`,
+    )
+    .bind(symbol, ts, setup, direction, featuresJson, notes)
+    .run();
+}
+
 export async function startIngestRun(db: D1Database): Promise<number> {
   const now = Math.floor(Date.now() / 1000);
   const res = await db

@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev --persist-to ../../.wrangler/state",
+    "tick": "while true; do curl -s http://localhost:8787/run; echo; sleep 60; done",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit"
   },
