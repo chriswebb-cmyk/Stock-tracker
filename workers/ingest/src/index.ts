@@ -1,4 +1,5 @@
 import { FinnhubClient, RateLimiter, RateLimitError } from './finnhub';
+import { YahooClient, YahooError } from './yahoo';
 import {
   finishIngestRun,
   insertSignal,
@@ -21,11 +22,9 @@ export interface Env {
   SIGNAL_COOLDOWN_SECONDS?: string;
 }
 
-// US market hours in ET: 09:30 - 16:00. The cron triggers every minute, but
-// we only do work during that window.
 function isMarketHoursEt(d: Date): boolean {
   const dow = d.getUTCDay();
-  if (dow === 0 || dow === 6) return false; // weekend
+  if (dow === 0 || dow === 6) return false;
   const utcHour = d.getUTCHours();
   const utcMin = d.getUTCMinutes();
   const etHour = (utcHour - 4 + 24) % 24;
@@ -38,11 +37,15 @@ export default {
     ctx.waitUntil(runIngest(env, new Date(event.scheduledTime)));
   },
 
-  // Manual trigger for local testing: `curl http://localhost:8787/run`.
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === '/run') {
       const result = await runIngest(env, new Date(), { force: true });
+      return Response.json(result);
+    }
+    if (url.pathname === '/backfill') {
+      const days = Math.max(1, Math.min(7, Number(url.searchParams.get('days') ?? '7')));
+      const result = await runBackfill(env, days);
       return Response.json(result);
     }
     if (url.pathname === '/health') {
@@ -81,41 +84,92 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
   ran: boolean;
   symbols: number;
   apiCalls: number;
+  yahooOk: number;
+  finnhubFallback: number;
   errors: number;
   signals: number;
   notified: number;
+  barsWritten: number;
 }> {
   if (!opts.force && !isMarketHoursEt(now)) {
-    return { ran: false, symbols: 0, apiCalls: 0, errors: 0, signals: 0, notified: 0 };
-  }
-  if (!env.FINNHUB_API_KEY) {
-    throw new Error('FINNHUB_API_KEY is not set');
+    return { ran: false, symbols: 0, apiCalls: 0, yahooOk: 0, finnhubFallback: 0, errors: 0, signals: 0, notified: 0, barsWritten: 0 };
   }
 
   const runId = await startIngestRun(env.DB);
   const tickers = await listEnabledTickers(env.DB);
-  const client = new FinnhubClient(env.FINNHUB_API_KEY);
-  const rpm = Number(env.FINNHUB_REQUESTS_PER_MINUTE ?? '60');
-  const limiter = new RateLimiter(rpm);
+  const yahoo = new YahooClient();
+  const finnhub = env.FINNHUB_API_KEY ? new FinnhubClient(env.FINNHUB_API_KEY) : null;
+  const finnhubRpm = Number(env.FINNHUB_REQUESTS_PER_MINUTE ?? '60');
+  const finnhubLimiter = new RateLimiter(finnhubRpm);
   const cooldownSec = Number(env.SIGNAL_COOLDOWN_SECONDS ?? '1800');
   const webhookUrl = env.DISCORD_WEBHOOK_URL?.trim();
 
   let apiCalls = 0;
+  let yahooOk = 0;
+  let finnhubFallback = 0;
   let errors = 0;
   let signalsFound = 0;
   let notified = 0;
+  let barsWritten = 0;
   let errorText: string | null = null;
 
   for (const symbol of tickers) {
+    let signalQuote: { current: number; dayOpen: number; dayHigh: number; dayLow: number; prevClose: number } | null = null;
+    let signalTs: number | null = null;
+
     try {
-      await limiter.take(1);
-      const result = await client.quoteBar(symbol, '1min', now);
+      const result = await yahoo.latest(symbol, '1min');
       apiCalls += 1;
-      if (!result) continue;
+      yahooOk += 1;
+      if (result.bars.length > 0) {
+        await upsertBars(env.DB, result.bars);
+        barsWritten += result.bars.length;
+        const last = result.bars[result.bars.length - 1];
+        if (
+          result.prevClose != null &&
+          result.dayHigh != null &&
+          result.dayLow != null &&
+          result.dayOpen != null
+        ) {
+          signalQuote = {
+            current: result.current ?? last.close,
+            dayOpen: result.dayOpen,
+            dayHigh: result.dayHigh,
+            dayLow: result.dayLow,
+            prevClose: result.prevClose,
+          };
+          signalTs = last.ts;
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      errorText = errorText ? `${errorText}\nyahoo ${symbol}: ${msg}` : `yahoo ${symbol}: ${msg}`;
 
-      await upsertBars(env.DB, [result.bar]);
+      if (finnhub) {
+        try {
+          await finnhubLimiter.take(1);
+          const result = await finnhub.quoteBar(symbol, '1min', now);
+          apiCalls += 1;
+          finnhubFallback += 1;
+          if (result) {
+            await upsertBars(env.DB, [result.bar]);
+            barsWritten += 1;
+            signalQuote = result.quote;
+            signalTs = result.bar.ts;
+          }
+        } catch (fbErr) {
+          errors += 1;
+          const fbMsg = fbErr instanceof Error ? fbErr.message : String(fbErr);
+          errorText = errorText ? `${errorText}\nfinnhub ${symbol}: ${fbMsg}` : `finnhub ${symbol}: ${fbMsg}`;
+          if (fbErr instanceof RateLimitError) break;
+        }
+      } else {
+        errors += 1;
+      }
+    }
 
-      const detected = detectSignals(symbol, result.bar.ts, result.quote);
+    if (signalQuote && signalTs !== null) {
+      const detected = detectSignals(symbol, signalTs, signalQuote);
       for (const sig of detected) {
         signalsFound += 1;
         const last = await lastSignalTs(env.DB, sig.symbol, sig.setup);
@@ -125,9 +179,9 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
           price: sig.price,
           prev_close: sig.prevClose,
           change_pct: sig.changePct,
-          day_high: result.quote.dayHigh,
-          day_low: result.quote.dayLow,
-          day_open: result.quote.dayOpen,
+          day_high: signalQuote.dayHigh,
+          day_low: signalQuote.dayLow,
+          day_open: signalQuote.dayOpen,
         });
         await insertSignal(env.DB, sig.symbol, sig.ts, sig.setup, sig.direction, sig.notes, features);
 
@@ -143,14 +197,55 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
           }
         }
       }
-    } catch (err) {
-      errors += 1;
-      const msg = err instanceof Error ? err.message : String(err);
-      errorText = errorText ? `${errorText}\n${symbol}: ${msg}` : `${symbol}: ${msg}`;
-      if (err instanceof RateLimitError) break;
     }
   }
 
   await finishIngestRun(env.DB, runId, tickers.length, apiCalls, errors, errorText);
-  return { ran: true, symbols: tickers.length, apiCalls, errors, signals: signalsFound, notified };
+  return {
+    ran: true,
+    symbols: tickers.length,
+    apiCalls,
+    yahooOk,
+    finnhubFallback,
+    errors,
+    signals: signalsFound,
+    notified,
+    barsWritten,
+  };
+}
+
+// Pulls `days` of 1-min bars (Yahoo caps at 7d for 1m) for every enabled
+// ticker and stores them. Run once after deploy to seed history.
+async function runBackfill(env: Env, days: number): Promise<{
+  symbols: number;
+  barsWritten: number;
+  errors: number;
+  errorText: string | null;
+}> {
+  const tickers = await listEnabledTickers(env.DB);
+  const yahoo = new YahooClient();
+  let barsWritten = 0;
+  let errors = 0;
+  let errorText: string | null = null;
+  const range = `${days}d`;
+
+  for (const symbol of tickers) {
+    try {
+      const result = await yahoo.chart(symbol, '1min', range);
+      if (result.bars.length > 0) {
+        await upsertBars(env.DB, result.bars);
+        barsWritten += result.bars.length;
+      }
+    } catch (err) {
+      errors += 1;
+      const msg = err instanceof Error ? err.message : String(err);
+      if (err instanceof YahooError && /rate|429/i.test(msg)) {
+        errorText = errorText ? `${errorText}\n${symbol}: ${msg} (aborting)` : `${symbol}: ${msg} (aborting)`;
+        break;
+      }
+      errorText = errorText ? `${errorText}\n${symbol}: ${msg}` : `${symbol}: ${msg}`;
+    }
+  }
+
+  return { symbols: tickers.length, barsWritten, errors, errorText };
 }
