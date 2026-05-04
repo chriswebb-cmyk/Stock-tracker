@@ -67,10 +67,10 @@ export default function App() {
 
   return (
     <div className="h-full flex flex-col">
-      <header className="flex items-center justify-between border-b border-slate-800 px-4 py-2">
+      <header className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 px-3 py-2">
         <div className="flex items-baseline gap-3">
-          <h1 className="text-lg font-semibold tracking-tight">Stock Tracker</h1>
-          <span className="text-xs text-slate-500">Phase 2 · indicators + backtest</span>
+          <h1 className="text-base sm:text-lg font-semibold tracking-tight">Stock Tracker</h1>
+          <span className="hidden sm:inline text-xs text-slate-500">Phase 2 · indicators + backtest</span>
         </div>
         <StatusBar latest={latestRun} />
       </header>
@@ -104,8 +104,8 @@ export default function App() {
           <MlPanel />
         </div>
       ) : tab === 'chart' ? (
-        <div className="flex-1 grid grid-cols-[220px_1fr] min-h-0">
-          <aside className="border-r border-slate-800 overflow-y-auto">
+        <div className="flex-1 grid grid-cols-1 md:grid-cols-[220px_1fr] min-h-0">
+          <aside className="hidden md:block border-r border-slate-800 overflow-y-auto">
             <div className="px-4 py-3 text-xs uppercase tracking-wider text-slate-500">
               Watchlist
             </div>
@@ -113,6 +113,20 @@ export default function App() {
           </aside>
 
           <main className="flex flex-col min-h-0">
+            <div className="md:hidden px-4 py-2 border-b border-slate-800">
+              <select
+                value={selected ?? ''}
+                onChange={(e) => setSelected(e.target.value || null)}
+                className="w-full bg-slate-900 border border-slate-800 rounded px-3 py-2 text-base text-slate-100"
+              >
+                {tickers.map((t) => (
+                  <option key={t.symbol} value={t.symbol}>
+                    {t.symbol}
+                  </option>
+                ))}
+              </select>
+            </div>
+
             <div className="flex items-center justify-between border-b border-slate-800 px-4 py-2">
               <div className="text-base font-medium">{selected ?? '—'}</div>
               <div className="flex gap-1">
