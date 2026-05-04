@@ -90,6 +90,15 @@ CREATE TABLE IF NOT EXISTS ingest_runs (
   error_text    TEXT
 );
 
+-- Generic JSON cache. Used so the backtest summary doesn't have to be
+-- recomputed on every dashboard load (which trips the 10ms free-tier CPU
+-- budget). The weekly retrain cron writes this; /backtest-summary reads it.
+CREATE TABLE IF NOT EXISTS json_cache (
+  key         TEXT PRIMARY KEY,
+  value       TEXT NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+
 -- Per-setup logistic regression model trained on backtest results. One row
 -- per setup; retraining replaces the row.
 CREATE TABLE IF NOT EXISTS models (

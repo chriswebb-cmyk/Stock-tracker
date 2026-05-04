@@ -15,12 +15,20 @@ const VALID_INTERVALS: BarInterval[] = ['1min', '5min', '15min', '30min', '60min
 
 export default {
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Weekly retrain on whatever bars are in D1 right now. Logs the result on
-    // the worker's tail; failure here is non-fatal (next week tries again).
     ctx.waitUntil(
-      trainModels(env.DB, 7, 30, 1800).catch((err) => {
-        console.error('weekly retrain failed', err);
-      }),
+      (async () => {
+        try {
+          await trainModels(env.DB, 7, 30, 1800);
+        } catch (err) {
+          console.error('weekly retrain failed', err);
+        }
+        try {
+          const summary = await getBacktestSummary(env.DB, 7, 30, 1800);
+          await writeCache(env.DB, 'backtest-summary-7-30-1800', JSON.stringify(summary));
+        } catch (err) {
+          console.error('backtest cache refresh failed', err);
+        }
+      })(),
     );
   },
 
@@ -115,11 +123,14 @@ async function route(url: URL, request: Request, env: Env): Promise<unknown> {
   }
 
   // /backtest-summary?days=7&hold=30 — aggregated across all enabled tickers.
+  // Cached in D1 because the full sweep blows the free-tier 10ms CPU budget.
+  // Pass &refresh=1 to bypass cache (may 503 on free tier).
   if (path === '/backtest-summary' && request.method === 'GET') {
     const days = clampInt(url.searchParams.get('days'), 1, 30, 7);
     const hold = clampInt(url.searchParams.get('hold'), 1, 240, 30);
     const cooldown = clampInt(url.searchParams.get('cooldown'), 0, 86400, 1800);
-    return getBacktestSummary(env.DB, days, hold, cooldown);
+    const refresh = url.searchParams.get('refresh') === '1';
+    return getCachedBacktestSummary(env.DB, days, hold, cooldown, refresh);
   }
 
   throw new HttpError(404, 'not found');
@@ -271,6 +282,40 @@ async function runBacktest(
   const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
   const bars = await loadBarsSince(db, symbol, '1min', sinceTs);
   return backtest(symbol, bars, holdMinutes, cooldownSec);
+}
+
+async function getCachedBacktestSummary(
+  db: D1Database,
+  days: number,
+  holdMinutes: number,
+  cooldownSec: number,
+  refresh: boolean,
+): Promise<{ symbols: number; trades: number; bySetup: SetupStats[]; cachedAt: number | null; stale: boolean }> {
+  const key = `backtest-summary-${days}-${holdMinutes}-${cooldownSec}`;
+  if (!refresh) {
+    const row = await db
+      .prepare('SELECT value, updated_at FROM json_cache WHERE key = ?')
+      .bind(key)
+      .first<{ value: string; updated_at: number }>();
+    if (row) {
+      const ageHours = (Math.floor(Date.now() / 1000) - row.updated_at) / 3600;
+      const parsed = JSON.parse(row.value) as { symbols: number; trades: number; bySetup: SetupStats[] };
+      return { ...parsed, cachedAt: row.updated_at, stale: ageHours > 24 };
+    }
+  }
+  const fresh = await getBacktestSummary(db, days, holdMinutes, cooldownSec);
+  await writeCache(db, key, JSON.stringify(fresh));
+  return { ...fresh, cachedAt: Math.floor(Date.now() / 1000), stale: false };
+}
+
+async function writeCache(db: D1Database, key: string, value: string): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO json_cache(key, value, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    )
+    .bind(key, value, Math.floor(Date.now() / 1000))
+    .run();
 }
 
 async function getBacktestSummary(
