@@ -48,6 +48,27 @@ export default {
     if (url.pathname === '/health') {
       return Response.json({ ok: true });
     }
+    if (url.pathname === '/test-discord') {
+      if (!env.DISCORD_WEBHOOK_URL) {
+        return Response.json({ ok: false, error: 'DISCORD_WEBHOOK_URL not set' }, { status: 400 });
+      }
+      try {
+        await postDiscordSignal(env.DISCORD_WEBHOOK_URL, {
+          symbol: 'TEST',
+          ts: Math.floor(Date.now() / 1000),
+          setup: 'big_move_up',
+          direction: 'long',
+          price: 123.45,
+          prevClose: 120.00,
+          changePct: 0.02875,
+          notes: 'Test alert from /test-discord',
+        });
+        return Response.json({ ok: true });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return Response.json({ ok: false, error: msg }, { status: 500 });
+      }
+    }
     return new Response('not found', { status: 404 });
   },
 };
