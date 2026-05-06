@@ -43,13 +43,28 @@ export interface QuoteResult {
 export class FinnhubClient {
   constructor(private readonly apiKey: string) {}
 
-  private async get<T>(path: string, params: Record<string, string>): Promise<T> {
+  private async get<T>(path: string, params: Record<string, string>, timeoutMs = 5_000): Promise<T> {
     const url = new URL(`${BASE}${path}`);
     for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
     url.searchParams.set('token', this.apiKey);
-    const res = await fetch(url.toString(), {
-      headers: { 'User-Agent': 'stock-tracker/0.1' },
-    });
+    // Bound wall-clock time so a hung Finnhub request can't burn the cron's
+    // 30s budget and prevent finishIngestRun() from running.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let res: Response;
+    try {
+      res = await fetch(url.toString(), {
+        headers: { 'User-Agent': 'stock-tracker/0.1' },
+        signal: controller.signal,
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw new FinnhubError(`Finnhub timeout for ${path}`);
+      }
+      throw err;
+    }
+    clearTimeout(timer);
     if (res.status === 429) {
       throw new RateLimitError('Finnhub rate limit hit');
     }
