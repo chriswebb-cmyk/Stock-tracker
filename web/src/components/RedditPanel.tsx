@@ -8,19 +8,20 @@ type Window = '6h' | '24h' | '7d';
 const WINDOWS: Window[] = ['6h', '24h', '7d'];
 
 interface Props {
-  // When set, the parent's selected ticker is reflected back here so the post
-  // list filters down. Clicking a row in this panel calls onSelectSymbol so
-  // the parent can sync the chart tab.
-  selectedSymbol: string | null;
+  // Clicking a row in this panel calls onSelectSymbol so the parent can sync
+  // the Chart tab to that ticker. The post-list filter is driven by
+  // filterSymbol (internal state), so the chart's current symbol doesn't
+  // narrow what posts the user sees here by default.
   onSelectSymbol: (symbol: string) => void;
 }
 
-export function RedditPanel({ selectedSymbol, onSelectSymbol }: Props) {
+export function RedditPanel({ onSelectSymbol }: Props) {
   const [mode, setMode] = useState<Mode>('trending');
   const [windowSize, setWindowSize] = useState<Window>('24h');
   const [trending, setTrending] = useState<RedditTrending[]>([]);
   const [diamonds, setDiamonds] = useState<RedditDiamond[]>([]);
   const [posts, setPosts] = useState<RedditPost[]>([]);
+  const [filterSymbol, setFilterSymbol] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -54,7 +55,7 @@ export function RedditPanel({ selectedSymbol, onSelectSymbol }: Props) {
   useEffect(() => {
     let cancelled = false;
     api
-      .redditPosts(selectedSymbol, 25)
+      .redditPosts(filterSymbol, 25)
       .then((p) => {
         if (!cancelled) setPosts(p);
       })
@@ -64,7 +65,12 @@ export function RedditPanel({ selectedSymbol, onSelectSymbol }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [selectedSymbol]);
+  }, [filterSymbol]);
+
+  const handleRowClick = (symbol: string) => {
+    setFilterSymbol(symbol);
+    onSelectSymbol(symbol);
+  };
 
   const rows = useMemo(() => (mode === 'trending' ? trending : diamonds), [mode, trending, diamonds]);
 
@@ -128,9 +134,9 @@ export function RedditPanel({ selectedSymbol, onSelectSymbol }: Props) {
                   key={r.symbol}
                   className={
                     'border-t border-slate-900 cursor-pointer hover:bg-slate-900 ' +
-                    (r.symbol === selectedSymbol ? 'bg-slate-800' : '')
+                    (r.symbol === filterSymbol ? 'bg-slate-800' : '')
                   }
-                  onClick={() => onSelectSymbol(r.symbol)}
+                  onClick={() => handleRowClick(r.symbol)}
                 >
                   <td className="px-3 py-2 font-medium">{r.symbol}</td>
                   <td className="px-3 py-2 text-right tabular-nums">
@@ -159,8 +165,17 @@ export function RedditPanel({ selectedSymbol, onSelectSymbol }: Props) {
         </div>
 
         <div className="overflow-y-auto">
-          <div className="px-4 py-2 text-xs uppercase tracking-wider text-slate-500 border-b border-slate-800">
-            {selectedSymbol ? `Posts mentioning ${selectedSymbol}` : 'Latest posts'}
+          <div className="px-4 py-2 text-xs uppercase tracking-wider text-slate-500 border-b border-slate-800 flex items-center justify-between">
+            <span>{filterSymbol ? `Posts mentioning ${filterSymbol}` : 'Latest posts'}</span>
+            {filterSymbol && (
+              <button
+                type="button"
+                onClick={() => setFilterSymbol(null)}
+                className="text-xs normal-case tracking-normal text-slate-400 hover:text-slate-200"
+              >
+                clear filter
+              </button>
+            )}
           </div>
           <ul className="divide-y divide-slate-900">
             {posts.map((p) => (

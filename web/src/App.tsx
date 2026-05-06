@@ -106,7 +106,7 @@ export default function App() {
         </div>
       ) : tab === 'reddit' ? (
         <div className="flex-1 min-h-0">
-          <RedditPanel selectedSymbol={selected} onSelectSymbol={setSelected} />
+          <RedditPanel onSelectSymbol={setSelected} />
         </div>
       ) : tab === 'chart' ? (
         <div className="flex-1 grid grid-cols-1 md:grid-cols-[220px_1fr] min-h-0">
