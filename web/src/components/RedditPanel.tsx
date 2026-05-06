@@ -117,15 +117,15 @@ export function RedditPanel({ onSelectSymbol }: Props) {
         </div>
       )}
 
-      <div className="flex-1 grid grid-cols-[320px_1fr] min-h-0">
-        <div className="border-r border-slate-800 overflow-y-auto">
-          <table className="w-full text-sm">
-            <thead className="text-xs uppercase tracking-wider text-slate-500 sticky top-0 bg-slate-950">
+      <div className="flex-1 grid grid-rows-[auto_1fr] md:grid-rows-1 md:grid-cols-[280px_1fr] min-h-0">
+        <div className="border-b md:border-b-0 md:border-r border-slate-800 overflow-y-auto max-h-[40vh] md:max-h-none">
+          <table className="w-full text-xs sm:text-sm">
+            <thead className="text-[10px] sm:text-xs uppercase tracking-wider text-slate-500 sticky top-0 bg-slate-950">
               <tr>
-                <th className="text-left px-3 py-2">Symbol</th>
-                <th className="text-right px-3 py-2">Mentions</th>
-                <th className="text-right px-3 py-2">Sent.</th>
-                {mode === 'diamonds' && <th className="text-right px-3 py-2">Spike</th>}
+                <th className="text-left px-2 py-1.5">Sym</th>
+                <th className="text-right px-2 py-1.5">Ment.</th>
+                <th className="text-right px-2 py-1.5">Sent.</th>
+                {mode === 'diamonds' && <th className="text-right px-2 py-1.5">Spike</th>}
               </tr>
             </thead>
             <tbody>
@@ -138,16 +138,16 @@ export function RedditPanel({ onSelectSymbol }: Props) {
                   }
                   onClick={() => handleRowClick(r.symbol)}
                 >
-                  <td className="px-3 py-2 font-medium">{r.symbol}</td>
-                  <td className="px-3 py-2 text-right tabular-nums">
+                  <td className="px-2 py-1.5 font-medium">{r.symbol}</td>
+                  <td className="px-2 py-1.5 text-right tabular-nums">
                     {r.mentions}
-                    <span className="text-slate-500 text-xs"> / {r.posts}p</span>
+                    <span className="hidden sm:inline text-slate-500 text-xs"> / {r.posts}p</span>
                   </td>
-                  <td className={'px-3 py-2 text-right tabular-nums ' + sentimentColor(r.netSentiment)}>
+                  <td className={'px-2 py-1.5 text-right tabular-nums ' + sentimentColor(r.netSentiment)}>
                     {formatSentiment(r.netSentiment)}
                   </td>
                   {mode === 'diamonds' && (
-                    <td className="px-3 py-2 text-right tabular-nums text-amber-300">
+                    <td className="px-2 py-1.5 text-right tabular-nums text-amber-300">
                       {(r as RedditDiamond).spikeRatio.toFixed(1)}×
                     </td>
                   )}
@@ -164,22 +164,22 @@ export function RedditPanel({ onSelectSymbol }: Props) {
           </table>
         </div>
 
-        <div className="overflow-y-auto">
-          <div className="px-4 py-2 text-xs uppercase tracking-wider text-slate-500 border-b border-slate-800 flex items-center justify-between">
-            <span>{filterSymbol ? `Posts mentioning ${filterSymbol}` : 'Latest posts'}</span>
+        <div className="overflow-y-auto min-h-0">
+          <div className="px-3 sm:px-4 py-2 text-xs uppercase tracking-wider text-slate-500 border-b border-slate-800 flex items-center justify-between gap-2">
+            <span className="truncate">{filterSymbol ? `Posts mentioning ${filterSymbol}` : 'Latest posts'}</span>
             {filterSymbol && (
               <button
                 type="button"
                 onClick={() => setFilterSymbol(null)}
-                className="text-xs normal-case tracking-normal text-slate-400 hover:text-slate-200"
+                className="shrink-0 text-xs normal-case tracking-normal text-slate-400 hover:text-slate-200"
               >
-                clear filter
+                clear
               </button>
             )}
           </div>
           <ul className="divide-y divide-slate-900">
             {posts.map((p) => (
-              <li key={p.id} className="px-4 py-3 hover:bg-slate-900">
+              <li key={p.id} className="px-3 sm:px-4 py-3 hover:bg-slate-900">
                 <a
                   href={p.permalink ?? p.url ?? '#'}
                   target="_blank"
@@ -187,11 +187,11 @@ export function RedditPanel({ onSelectSymbol }: Props) {
                   className="block"
                 >
                   <div className="text-sm text-slate-100 leading-snug">{p.title}</div>
-                  <div className="mt-1 text-xs text-slate-500 flex gap-3">
+                  <div className="mt-1 text-xs text-slate-500 flex flex-wrap gap-x-3 gap-y-1">
                     <span>r/{p.subreddit}</span>
-                    {p.author && <span>u/{p.author}</span>}
+                    {p.author && <span className="hidden sm:inline">u/{p.author}</span>}
                     <span>{p.score.toLocaleString()} ▲</span>
-                    <span>{p.numComments} comments</span>
+                    <span>{p.numComments} 💬</span>
                     <span>{relativeTime(p.createdUtc)}</span>
                     {p.flair && (
                       <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">
