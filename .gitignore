@@ -8,6 +8,8 @@ dist/
 build/
 .wrangler/
 .netlify/
+tsconfig.tsbuildinfo
+*.tsbuildinfo
 
 # Env files
 .env
