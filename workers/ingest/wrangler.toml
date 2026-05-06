@@ -11,7 +11,7 @@ crons = ["* * * * *"]
 binding = "DB"
 database_name = "stock-tracker"
 # Replace with the id printed by `wrangler d1 create stock-tracker`.
-database_id = "REPLACE_WITH_D1_ID"
+database_id = "aa7f811d-46b5-4d1f-b2b8-f6fc5b0b43d6"
 
 [vars]
 FINNHUB_REQUESTS_PER_MINUTE = "60"
