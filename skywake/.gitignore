@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+build/
+.wrangler/
+.netlify/
+*.tsbuildinfo
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+.dev.vars
+
+# iOS
+ios/Skywake.xcodeproj/
+ios/Skywake.xcworkspace/
+ios/build/
+ios/DerivedData/
+ios/.build/
+ios/Pods/
+*.xcuserdata
+*.xcuserdatad
+*.xcuserstate
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# Local data / experiments
+data/
+*.parquet
+*.sqlite
+*.db
