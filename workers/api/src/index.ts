@@ -1,4 +1,12 @@
-import type { Bar, BarInterval, Ticker, IngestRun } from '../../../shared/types';
+import type {
+  Bar,
+  BarInterval,
+  Ticker,
+  IngestRun,
+  RedditDiamond,
+  RedditPost,
+  RedditTrending,
+} from '../../../shared/types';
 import { backtest, combineResults, type BacktestResult, type SetupStats } from '../../../shared/backtest';
 import { trainLogReg, modelToJson, type ModelStats } from '../../../shared/ml';
 import { FEATURE_NAMES, featuresToVector } from '../../../shared/features';
@@ -141,7 +149,42 @@ async function route(url: URL, request: Request, env: Env): Promise<unknown> {
     return getCachedBacktestSummary(env.DB, days, hold, cooldown, refresh);
   }
 
+  // Reddit endpoints. The scraper worker writes reddit_posts +
+  // reddit_mentions; these are pure reads.
+  if (path === '/reddit/trending' && request.method === 'GET') {
+    const window = parseWindow(url.searchParams.get('window'), 24 * 3600);
+    const limit = clampInt(url.searchParams.get('limit'), 1, 200, 30);
+    const subreddit = url.searchParams.get('subreddit');
+    return getRedditTrending(env.DB, window, limit, subreddit);
+  }
+  if (path === '/reddit/diamonds' && request.method === 'GET') {
+    const recent = parseWindow(url.searchParams.get('recent'), 6 * 3600);
+    const baseline = parseWindow(url.searchParams.get('baseline'), 7 * 86400);
+    const limit = clampInt(url.searchParams.get('limit'), 1, 100, 20);
+    const subreddit = url.searchParams.get('subreddit');
+    return getRedditDiamonds(env.DB, recent, baseline, limit, subreddit);
+  }
+  const postsMatch = path.match(/^\/reddit\/posts\/?$/);
+  if (postsMatch && request.method === 'GET') {
+    const symbol = url.searchParams.get('symbol');
+    const limit = clampInt(url.searchParams.get('limit'), 1, 100, 25);
+    const subreddit = url.searchParams.get('subreddit');
+    return getRedditPosts(env.DB, symbol, limit, subreddit);
+  }
+
   throw new HttpError(404, 'not found');
+}
+
+function parseWindow(raw: string | null, fallbackSeconds: number): number {
+  // Accepts plain integers (seconds) or shorthand like '24h' / '7d' / '30m'.
+  if (!raw) return fallbackSeconds;
+  const m = raw.match(/^(\d+)([smhd])?$/);
+  if (!m) return fallbackSeconds;
+  const n = parseInt(m[1] ?? '', 10);
+  if (!Number.isFinite(n)) return fallbackSeconds;
+  const unit = m[2] ?? 's';
+  const mul = unit === 'd' ? 86400 : unit === 'h' ? 3600 : unit === 'm' ? 60 : 1;
+  return Math.min(30 * 86400, Math.max(60, n * mul));
 }
 
 class HttpError extends Error {
@@ -464,4 +507,199 @@ async function getSignals(db: D1Database, limit: number): Promise<unknown[]> {
     .bind(limit)
     .all();
   return results;
+}
+
+interface TrendingRow {
+  symbol: string;
+  posts: number;
+  mentions: number;
+  net_sentiment: number;
+  total_score: number;
+  top_post_id: string | null;
+  top_post_title: string | null;
+}
+
+async function getRedditTrending(
+  db: D1Database,
+  windowSeconds: number,
+  limit: number,
+  subreddit: string | null,
+): Promise<RedditTrending[]> {
+  const since = Math.floor(Date.now() / 1000) - windowSeconds;
+  // For each symbol in the window, take the highest-scoring post as the
+  // 'top post' surface. Done with a correlated subquery for portability —
+  // D1's SQLite supports it cleanly.
+  const sql = `
+    SELECT m.symbol                                             AS symbol,
+           COUNT(DISTINCT p.id)                                 AS posts,
+           SUM(m.mention_count)                                 AS mentions,
+           AVG(m.sentiment)                                     AS net_sentiment,
+           SUM(p.score)                                         AS total_score,
+           (SELECT p2.id    FROM reddit_mentions m2
+              JOIN reddit_posts p2 ON p2.id = m2.post_id
+             WHERE m2.symbol = m.symbol
+               AND p2.created_utc >= ?1
+               ${subreddit ? 'AND p2.subreddit = ?4' : ''}
+             ORDER BY p2.score DESC LIMIT 1)                    AS top_post_id,
+           (SELECT p2.title FROM reddit_mentions m2
+              JOIN reddit_posts p2 ON p2.id = m2.post_id
+             WHERE m2.symbol = m.symbol
+               AND p2.created_utc >= ?1
+               ${subreddit ? 'AND p2.subreddit = ?4' : ''}
+             ORDER BY p2.score DESC LIMIT 1)                    AS top_post_title
+      FROM reddit_mentions m
+      JOIN reddit_posts p ON p.id = m.post_id
+     WHERE p.created_utc >= ?1
+       ${subreddit ? 'AND p.subreddit = ?4' : ''}
+     GROUP BY m.symbol
+     ORDER BY mentions DESC, posts DESC
+     LIMIT ?2`;
+  const stmt = subreddit
+    ? db.prepare(sql).bind(since, limit, since, subreddit)
+    : db.prepare(sql).bind(since, limit);
+  const { results } = await stmt.all<TrendingRow>();
+  return results.map((r) => ({
+    symbol: r.symbol,
+    posts: r.posts,
+    mentions: r.mentions,
+    netSentiment: r.net_sentiment,
+    totalScore: r.total_score,
+    topPostId: r.top_post_id,
+    topPostTitle: r.top_post_title,
+  }));
+}
+
+async function getRedditDiamonds(
+  db: D1Database,
+  recentSeconds: number,
+  baselineSeconds: number,
+  limit: number,
+  subreddit: string | null,
+): Promise<RedditDiamond[]> {
+  const now = Math.floor(Date.now() / 1000);
+  const recentSince = now - recentSeconds;
+  const baselineSince = now - baselineSeconds;
+
+  // Recent vs. baseline mention counts per symbol. spike_ratio is normalised
+  // by window length so a 6h burst on a symbol with low 7d activity scores
+  // higher than something that's been steady all week.
+  const subFilter = subreddit ? 'AND p.subreddit = ?5' : '';
+  const sql = `
+    WITH recent AS (
+      SELECT m.symbol, SUM(m.mention_count) AS mentions, COUNT(DISTINCT p.id) AS posts,
+             AVG(m.sentiment) AS net_sentiment, SUM(p.score) AS total_score
+        FROM reddit_mentions m JOIN reddit_posts p ON p.id = m.post_id
+       WHERE p.created_utc >= ?1 ${subFilter}
+       GROUP BY m.symbol
+    ),
+    baseline AS (
+      SELECT m.symbol, SUM(m.mention_count) AS mentions
+        FROM reddit_mentions m JOIN reddit_posts p ON p.id = m.post_id
+       WHERE p.created_utc >= ?2 AND p.created_utc < ?1 ${subFilter}
+       GROUP BY m.symbol
+    ),
+    top_post AS (
+      SELECT m.symbol, p.id AS top_post_id, p.title AS top_post_title,
+             ROW_NUMBER() OVER (PARTITION BY m.symbol ORDER BY p.score DESC) AS rn
+        FROM reddit_mentions m JOIN reddit_posts p ON p.id = m.post_id
+       WHERE p.created_utc >= ?1 ${subFilter}
+    )
+    SELECT r.symbol                                            AS symbol,
+           r.posts                                             AS posts,
+           r.mentions                                          AS mentions,
+           r.net_sentiment                                     AS net_sentiment,
+           r.total_score                                       AS total_score,
+           t.top_post_id                                       AS top_post_id,
+           t.top_post_title                                    AS top_post_title,
+           COALESCE(b.mentions, 0)                             AS baseline_mentions,
+           -- recent_rate / baseline_rate, with a small floor so brand-new
+           -- symbols (baseline = 0) don't divide by zero. baseline_rate is
+           -- mentions normalized to the recent-window length.
+           (CAST(r.mentions AS REAL) / (?3 / 3600.0))
+             / ((CAST(COALESCE(b.mentions, 0) AS REAL) + 0.5)
+                / ((?4 - ?3) / 3600.0))                        AS spike_ratio
+      FROM recent r
+      LEFT JOIN baseline b ON b.symbol = r.symbol
+      LEFT JOIN top_post  t ON t.symbol = r.symbol AND t.rn = 1
+     WHERE r.mentions >= 2
+     ORDER BY spike_ratio DESC, r.mentions DESC
+     LIMIT ?6`;
+  const stmt = subreddit
+    ? db.prepare(sql).bind(recentSince, baselineSince, recentSeconds, baselineSeconds, subreddit, limit)
+    : db.prepare(sql).bind(recentSince, baselineSince, recentSeconds, baselineSeconds, limit);
+  const { results } = await stmt.all<TrendingRow & { baseline_mentions: number; spike_ratio: number }>();
+  return results.map((r) => ({
+    symbol: r.symbol,
+    posts: r.posts,
+    mentions: r.mentions,
+    netSentiment: r.net_sentiment,
+    totalScore: r.total_score,
+    topPostId: r.top_post_id,
+    topPostTitle: r.top_post_title,
+    baselineMentions: r.baseline_mentions,
+    spikeRatio: r.spike_ratio,
+  }));
+}
+
+interface PostRow {
+  id: string;
+  subreddit: string;
+  author: string | null;
+  title: string;
+  selftext: string | null;
+  flair: string | null;
+  score: number;
+  num_comments: number;
+  permalink: string | null;
+  url: string | null;
+  created_utc: number;
+  fetched_at: number;
+}
+
+async function getRedditPosts(
+  db: D1Database,
+  symbol: string | null,
+  limit: number,
+  subreddit: string | null,
+): Promise<RedditPost[]> {
+  let stmt: D1PreparedStatement;
+  if (symbol) {
+    const sym = symbol.toUpperCase();
+    const sql = `SELECT p.id, p.subreddit, p.author, p.title, p.selftext, p.flair,
+                        p.score, p.num_comments, p.permalink, p.url,
+                        p.created_utc, p.fetched_at
+                   FROM reddit_posts p
+                   JOIN reddit_mentions m ON m.post_id = p.id
+                  WHERE m.symbol = ?
+                  ${subreddit ? 'AND p.subreddit = ?3' : ''}
+                  ORDER BY p.score DESC, p.created_utc DESC
+                  LIMIT ?2`;
+    stmt = subreddit
+      ? db.prepare(sql).bind(sym, limit, subreddit)
+      : db.prepare(sql).bind(sym, limit);
+  } else {
+    const sql = `SELECT id, subreddit, author, title, selftext, flair,
+                        score, num_comments, permalink, url,
+                        created_utc, fetched_at
+                   FROM reddit_posts
+                  ${subreddit ? 'WHERE subreddit = ?2' : ''}
+                  ORDER BY created_utc DESC
+                  LIMIT ?1`;
+    stmt = subreddit ? db.prepare(sql).bind(limit, subreddit) : db.prepare(sql).bind(limit);
+  }
+  const { results } = await stmt.all<PostRow>();
+  return results.map((r) => ({
+    id: r.id,
+    subreddit: r.subreddit,
+    author: r.author,
+    title: r.title,
+    selftext: r.selftext,
+    flair: r.flair,
+    score: r.score,
+    numComments: r.num_comments,
+    permalink: r.permalink,
+    url: r.url,
+    createdUtc: r.created_utc,
+    fetchedAt: r.fetched_at,
+  }));
 }

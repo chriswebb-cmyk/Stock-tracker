@@ -1,4 +1,12 @@
-import type { Bar, BarInterval, IngestRun, Ticker } from '../../shared/types';
+import type {
+  Bar,
+  BarInterval,
+  IngestRun,
+  RedditDiamond,
+  RedditPost,
+  RedditTrending,
+  Ticker,
+} from '../../shared/types';
 import type { BacktestResult, SetupStats } from '../../shared/backtest';
 
 const BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8788';
@@ -67,4 +75,16 @@ export const api = {
     if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
     return (await res.json()) as TrainResult;
   },
+  redditTrending: (window = '24h', limit = 30) =>
+    getJson<RedditTrending[]>(`/reddit/trending?window=${window}&limit=${limit}`),
+  redditDiamonds: (recent = '6h', baseline = '7d', limit = 20) =>
+    getJson<RedditDiamond[]>(
+      `/reddit/diamonds?recent=${recent}&baseline=${baseline}&limit=${limit}`,
+    ),
+  redditPosts: (symbol: string | null, limit = 25) =>
+    getJson<RedditPost[]>(
+      symbol
+        ? `/reddit/posts?symbol=${encodeURIComponent(symbol)}&limit=${limit}`
+        : `/reddit/posts?limit=${limit}`,
+    ),
 };

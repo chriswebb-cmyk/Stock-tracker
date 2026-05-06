@@ -7,10 +7,11 @@ import { IndicatorPanel } from './components/IndicatorPanel';
 import { StatusBar } from './components/StatusBar';
 import { BacktestPanel } from './components/BacktestPanel';
 import { MlPanel } from './components/MlPanel';
+import { RedditPanel } from './components/RedditPanel';
 
 const INTERVALS: BarInterval[] = ['1min', '5min', '15min', '60min'];
 
-type Tab = 'chart' | 'backtest' | 'ml';
+type Tab = 'chart' | 'backtest' | 'ml' | 'reddit';
 
 export default function App() {
   const [tickers, setTickers] = useState<Ticker[]>([]);
@@ -82,7 +83,7 @@ export default function App() {
       )}
 
       <div className="flex border-b border-slate-800 px-4">
-        {(['chart', 'backtest', 'ml'] as Tab[]).map((t) => (
+        {(['chart', 'backtest', 'ml', 'reddit'] as Tab[]).map((t) => (
           <button
             key={t}
             type="button"
@@ -102,6 +103,10 @@ export default function App() {
       {tab === 'ml' ? (
         <div className="flex-1 overflow-y-auto">
           <MlPanel />
+        </div>
+      ) : tab === 'reddit' ? (
+        <div className="flex-1 min-h-0">
+          <RedditPanel selectedSymbol={selected} onSelectSymbol={setSelected} />
         </div>
       ) : tab === 'chart' ? (
         <div className="flex-1 grid grid-cols-1 md:grid-cols-[220px_1fr] min-h-0">

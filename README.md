@@ -49,6 +49,7 @@ runs ML pattern detection, and pushes high-confidence setups to Discord.
 |------------------------|---------------------------------------------------|
 | `web/`                 | React + Vite + Tailwind dashboard                 |
 | `workers/ingest/`      | Cloudflare Worker cron that polls Alpha Vantage   |
+| `workers/reddit/`      | Cloudflare Worker cron that scrapes r/wallstreetbets |
 | `workers/api/`         | Cloudflare Worker exposing read endpoints to web  |
 | `db/schema.sql`        | D1 schema                                         |
 | `shared/`              | TS types shared between workers and web           |
@@ -126,6 +127,39 @@ Edit the `tickers` table in D1 to change which symbols are tracked. Defaults
 seeded by `db/schema.sql`:
 
 - SPY, QQQ, AAPL, NVDA, TSLA
+
+## Reddit / WallStreetBets scraper
+
+`workers/reddit/` is a separate cron worker that scrapes
+`r/wallstreetbets` (and any other subs you add via the `SUBREDDITS` var)
+every 15 minutes. It pulls the `hot` and `new` listings, extracts ticker
+mentions from each post (cashtags like `$NVDA` plus uppercase words
+validated against a curated universe in `workers/reddit/src/tickers.ts`)
+and scores a crude bull/bear sentiment from keyword and emoji patterns.
+
+Two derived views are exposed via the API and surfaced in the dashboard's
+**Reddit** tab:
+
+- **Trending** — symbols ranked by total mentions in a window (`6h` / `24h` / `7d`).
+- **Hidden Diamonds** — symbols whose mention rate over the last 6h is
+  spiking vs. their 7d baseline. Useful for catching tickers ramping up
+  in chatter before they hit the front page.
+
+Endpoints on the read API:
+
+- `GET /reddit/trending?window=24h&limit=30`
+- `GET /reddit/diamonds?recent=6h&baseline=7d&limit=20`
+- `GET /reddit/posts?symbol=NVDA&limit=25`
+
+To deploy: install deps in `workers/reddit/`, set the D1 `database_id` in
+`wrangler.toml`, customize `REDDIT_USER_AGENT` (Reddit asks for a unique
+descriptive UA), then `npx wrangler deploy`. Local: `npm run dev` and
+`curl http://localhost:8789/run` to trigger a scrape on demand.
+
+> Reddit's public JSON endpoints are unauthenticated and soft-rate-limited
+> (~60 req/min). With 1 sub × 2 listings × 4 scrapes/hr we use ~8 req/hr,
+> well below the cap. If you scale up, swap to the OAuth API (client
+> credentials grant) using the secrets stubbed out in `wrangler.toml`.
 
 ## Honest limitations
 

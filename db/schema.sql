@@ -114,3 +114,50 @@ CREATE TABLE IF NOT EXISTS models (
 -- Seed the default watchlist.
 INSERT OR IGNORE INTO tickers(symbol) VALUES
   ('SPY'), ('QQQ'), ('AAPL'), ('NVDA'), ('TSLA');
+
+-- Reddit posts pulled from r/wallstreetbets (and any other subs we add). One
+-- row per Reddit post id ('t3_xxxx'), upserted on each scrape so score and
+-- num_comments stay fresh while the post is hot.
+CREATE TABLE IF NOT EXISTS reddit_posts (
+  id            TEXT PRIMARY KEY,             -- Reddit fullname or id
+  subreddit     TEXT NOT NULL,
+  author        TEXT,
+  title         TEXT NOT NULL,
+  selftext      TEXT,
+  flair         TEXT,
+  score         INTEGER NOT NULL DEFAULT 0,
+  num_comments  INTEGER NOT NULL DEFAULT 0,
+  permalink     TEXT,
+  url           TEXT,
+  created_utc   INTEGER NOT NULL,             -- post creation, unix seconds
+  fetched_at    INTEGER NOT NULL              -- last time we refreshed it
+);
+CREATE INDEX IF NOT EXISTS reddit_posts_created
+  ON reddit_posts(created_utc DESC);
+CREATE INDEX IF NOT EXISTS reddit_posts_sub_created
+  ON reddit_posts(subreddit, created_utc DESC);
+
+-- Ticker mentions extracted from a post's title + selftext. mention_count is
+-- how many times the symbol appears in that single post; sentiment is a
+-- bullish-minus-bearish keyword score in [-1, 1].
+CREATE TABLE IF NOT EXISTS reddit_mentions (
+  post_id        TEXT NOT NULL REFERENCES reddit_posts(id) ON DELETE CASCADE,
+  symbol         TEXT NOT NULL,
+  mention_count  INTEGER NOT NULL DEFAULT 1,
+  sentiment      REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (post_id, symbol)
+);
+CREATE INDEX IF NOT EXISTS reddit_mentions_symbol
+  ON reddit_mentions(symbol);
+
+-- Heartbeat for the reddit scraper, parallel to ingest_runs.
+CREATE TABLE IF NOT EXISTS reddit_runs (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  started_at    INTEGER NOT NULL,
+  finished_at   INTEGER,
+  posts_seen    INTEGER NOT NULL DEFAULT 0,
+  posts_new     INTEGER NOT NULL DEFAULT 0,
+  mentions      INTEGER NOT NULL DEFAULT 0,
+  errors        INTEGER NOT NULL DEFAULT 0,
+  error_text    TEXT
+);

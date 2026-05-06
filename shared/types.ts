@@ -61,3 +61,54 @@ export interface IngestRun {
   errors: number;
   errorText: string | null;
 }
+
+export interface RedditPost {
+  id: string;
+  subreddit: string;
+  author: string | null;
+  title: string;
+  selftext: string | null;
+  flair: string | null;
+  score: number;
+  numComments: number;
+  permalink: string | null;
+  url: string | null;
+  createdUtc: number;
+  fetchedAt: number;
+}
+
+export interface RedditMention {
+  postId: string;
+  symbol: string;
+  mentionCount: number;
+  sentiment: number; // -1..1
+}
+
+// Aggregate row returned by /reddit/trending.
+export interface RedditTrending {
+  symbol: string;
+  posts: number;          // distinct posts mentioning the symbol
+  mentions: number;       // total textual mentions
+  netSentiment: number;   // mean sentiment across posts, -1..1
+  totalScore: number;     // sum of post upvote scores
+  topPostId: string | null;
+  topPostTitle: string | null;
+}
+
+// "Hidden diamond" = symbol whose mention rate spiked recently vs. its
+// longer-term baseline. The API computes the ratio server-side.
+export interface RedditDiamond extends RedditTrending {
+  baselineMentions: number;   // mentions over the baseline window
+  spikeRatio: number;         // recent / baseline, normalised
+}
+
+export interface RedditRun {
+  id: number;
+  startedAt: number;
+  finishedAt: number | null;
+  postsSeen: number;
+  postsNew: number;
+  mentions: number;
+  errors: number;
+  errorText: string | null;
+}
