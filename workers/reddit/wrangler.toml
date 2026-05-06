@@ -12,7 +12,7 @@ crons = ["*/15 * * * *"]
 binding = "DB"
 database_name = "stock-tracker"
 # Same id as in workers/ingest/wrangler.toml.
-database_id = "REPLACE_WITH_D1_ID"
+database_id = "aa7f811d-46b5-4d1f-b2b8-f6fc5b0b43d6"
 
 [vars]
 SUBREDDITS = "wallstreetbets"
@@ -22,7 +22,7 @@ POSTS_PER_LISTING = "100"
 # before it's voted up.
 LISTINGS = "hot,new"
 # User agent string Reddit asks for. Customize before deploying.
-REDDIT_USER_AGENT = "web:stock-tracker:0.1 (by /u/your_username)"
+REDDIT_USER_AGENT = "web:com.chris-stocks.stock-tracker:0.1"
 
 # Optional secret if you want to use OAuth instead of the public endpoint:
 #   wrangler secret put REDDIT_CLIENT_ID
