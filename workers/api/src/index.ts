@@ -22,22 +22,8 @@ export interface Env {
 const VALID_INTERVALS: BarInterval[] = ['1min', '5min', '15min', '30min', '60min'];
 
 export default {
-  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(
-      (async () => {
-        try {
-          await trainModels(env.DB, 7, 30, 1800);
-        } catch (err) {
-          console.error('weekly retrain failed', err);
-        }
-        try {
-          const summary = await getBacktestSummary(env.DB, 7, 30, 1800);
-          await writeCache(env.DB, 'backtest-summary-7-30-1800', JSON.stringify(summary));
-        } catch (err) {
-          console.error('backtest cache refresh failed', err);
-        }
-      })(),
-    );
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(refreshCaches(env, event.cron));
   },
 
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -333,6 +319,30 @@ async function runBacktest(
   const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
   const bars = await loadBarsSince(db, symbol, '1min', sinceTs);
   return backtest(symbol, bars, holdMinutes, cooldownSec);
+}
+
+// Cron entry point. Branches on the schedule that fired so the daily
+// after-close trigger doesn't re-run the expensive ML retrain.
+async function refreshCaches(env: Env, cron: string): Promise<void> {
+  const isWeeklyRetrain = cron === '0 6 * * SUN';
+  if (isWeeklyRetrain) {
+    try {
+      await trainModels(env.DB, 7, 30, 1800);
+    } catch (err) {
+      console.error('weekly retrain failed', err);
+    }
+  }
+  // Refresh the cached backtest summaries the dashboard reads. We always
+  // refresh both windows so each daily run keeps the '1d' tab fresh and the
+  // weekly run keeps the '7d' tab fresh; the cost is one extra sweep.
+  for (const days of [1, 7] as const) {
+    try {
+      const summary = await getBacktestSummary(env.DB, days, 30, 1800);
+      await writeCache(env.DB, `backtest-summary-${days}-30-1800`, JSON.stringify(summary));
+    } catch (err) {
+      console.error(`backtest cache refresh failed (days=${days})`, err);
+    }
+  }
 }
 
 async function getCachedBacktestSummary(

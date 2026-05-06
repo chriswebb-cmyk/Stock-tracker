@@ -13,7 +13,7 @@ const SETUP_LABEL: Record<string, string> = {
 };
 
 const HOLD_OPTIONS = [15, 30, 60, 120];
-const DAYS_OPTIONS = [3, 7];
+const DAYS_OPTIONS = [1, 3, 7];
 
 function fmtPct(p: number): string {
   return `${(p * 100).toFixed(2)}%`;

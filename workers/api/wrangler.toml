@@ -2,9 +2,13 @@ name = "stock-tracker-api"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
 
-# Sundays at 06:00 UTC (≈02:00 ET) — markets closed, no contention with ingest.
 [triggers]
-crons = ["0 6 * * SUN"]
+# Two cron schedules:
+#  - Sundays 06:00 UTC (≈02:00 ET): full ML retrain + cache the 7d backtest.
+#  - Weekdays 22:00 UTC (≈18:00 ET, ~2h after market close): refresh the 1d
+#    backtest cache so the dashboard's '1d' tab can serve from cache without
+#    blowing the free-tier CPU budget on every page load.
+crons = ["0 6 * * SUN", "0 22 * * 1-5"]
 
 [[d1_databases]]
 binding = "DB"
