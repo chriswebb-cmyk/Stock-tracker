@@ -703,7 +703,7 @@ async function getRedditPosts(
                    JOIN reddit_mentions m ON m.post_id = p.id
                   WHERE m.symbol = ?
                   ${subreddit ? 'AND p.subreddit = ?3' : ''}
-                  ORDER BY p.score DESC, p.created_utc DESC
+                  ORDER BY p.created_utc DESC
                   LIMIT ?2`;
     stmt = subreddit
       ? db.prepare(sql).bind(sym, limit, subreddit)
