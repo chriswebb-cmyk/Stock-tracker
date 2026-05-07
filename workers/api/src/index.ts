@@ -17,6 +17,9 @@ export interface Env {
   // Comma-separated list of allowed origins for CORS. Defaults to '*' for
   // dev convenience; set this in production.
   ALLOWED_ORIGINS?: string;
+  // Public URL of the reddit scraper worker. /reddit/scrape proxies to
+  // <REDDIT_WORKER_URL>/run.
+  REDDIT_WORKER_URL?: string;
 }
 
 const VALID_INTERVALS: BarInterval[] = ['1min', '5min', '15min', '30min', '60min'];
@@ -156,6 +159,24 @@ async function route(url: URL, request: Request, env: Env): Promise<unknown> {
     const limit = clampInt(url.searchParams.get('limit'), 1, 100, 25);
     const subreddit = url.searchParams.get('subreddit');
     return getRedditPosts(env.DB, symbol, limit, subreddit);
+  }
+
+  // Triggers an on-demand scrape on the reddit worker. The reddit worker
+  // doesn't ship CORS headers, so the dashboard hits this proxy instead.
+  if (path === '/reddit/scrape' && (request.method === 'POST' || request.method === 'GET')) {
+    if (!env.REDDIT_WORKER_URL) {
+      throw new HttpError(503, 'REDDIT_WORKER_URL not configured');
+    }
+    const upstream = await fetch(`${env.REDDIT_WORKER_URL.replace(/\/$/, '')}/run`, {
+      method: 'GET',
+      // Bound wall-clock — the scrape can take ~10s; we don't want the
+      // dashboard's loading spinner to hang forever if the worker stalls.
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!upstream.ok) {
+      throw new HttpError(upstream.status, `reddit worker ${upstream.status}`);
+    }
+    return upstream.json();
   }
 
   throw new HttpError(404, 'not found');

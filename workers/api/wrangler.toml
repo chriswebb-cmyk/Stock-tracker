@@ -19,3 +19,7 @@ database_id = "aa7f811d-46b5-4d1f-b2b8-f6fc5b0b43d6"
 [vars]
 # In dev keep '*'; tighten to your Netlify domain on deploy.
 ALLOWED_ORIGINS = "*"
+# Public URL of the reddit scraper worker. The /reddit/scrape endpoint
+# proxies to this so the dashboard can trigger a scrape without dealing
+# with cross-worker CORS.
+REDDIT_WORKER_URL = "https://stock-tracker-reddit.chris-stocks.workers.dev"

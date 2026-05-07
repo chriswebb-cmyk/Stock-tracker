@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../api';
 import type { RedditDiamond, RedditPost, RedditTrending } from '../../../shared/types';
 
@@ -23,60 +23,65 @@ export function RedditPanel({ onSelectSymbol }: Props) {
   const [posts, setPosts] = useState<RedditPost[]>([]);
   const [filterSymbol, setFilterSymbol] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [scraping, setScraping] = useState(false);
+  const [scrapeStatus, setScrapeStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
+  const reload = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
     setError(null);
-    const load = async () => {
-      try {
-        if (mode === 'trending') {
-          const data = await api.redditTrending(windowSize, 30);
-          if (!cancelled) setTrending(data);
-        } else {
-          const data = await api.redditDiamonds('6h', '7d', 20);
-          if (!cancelled) setDiamonds(data);
-        }
-      } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    };
-    load();
-    const id = window.setInterval(load, 60_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, [mode, windowSize]);
+    try {
+      const [aggregate, postList] = await Promise.all([
+        mode === 'trending' ? api.redditTrending(windowSize, 30) : api.redditDiamonds('6h', '7d', 20),
+        api.redditPosts(filterSymbol, 25),
+      ]);
+      if (signal?.aborted) return;
+      if (mode === 'trending') setTrending(aggregate as RedditTrending[]);
+      else setDiamonds(aggregate as RedditDiamond[]);
+      setPosts(postList);
+    } catch (e) {
+      if (signal?.aborted) return;
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (!signal?.aborted) setLoading(false);
+    }
+  }, [mode, windowSize, filterSymbol]);
 
   useEffect(() => {
-    let cancelled = false;
-    api
-      .redditPosts(filterSymbol, 25)
-      .then((p) => {
-        if (!cancelled) setPosts(p);
-      })
-      .catch((e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
-      });
+    const ctrl = new AbortController();
+    reload(ctrl.signal);
+    const id = window.setInterval(() => reload(ctrl.signal), 60_000);
     return () => {
-      cancelled = true;
+      ctrl.abort();
+      window.clearInterval(id);
     };
-  }, [filterSymbol]);
+  }, [reload]);
 
   const handleRowClick = (symbol: string) => {
     setFilterSymbol(symbol);
     onSelectSymbol(symbol);
   };
 
+  const handleRefresh = async () => {
+    setScraping(true);
+    setScrapeStatus(null);
+    setError(null);
+    try {
+      const r = await api.redditScrape();
+      setScrapeStatus(`Scraped ${r.postsSeen} posts (${r.postsNew} new, ${r.mentions} mentions${r.errors > 0 ? `, ${r.errors} errors` : ''})`);
+      await reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setScraping(false);
+    }
+  };
+
   const rows = useMemo(() => (mode === 'trending' ? trending : diamonds), [mode, trending, diamonds]);
 
   return (
     <div className="flex flex-col h-full min-h-0">
-      <div className="flex items-center gap-3 border-b border-slate-800 px-4 py-2">
+      <div className="flex flex-wrap items-center gap-2 border-b border-slate-800 px-3 sm:px-4 py-2">
         <div className="flex gap-1">
           <ModeButton active={mode === 'trending'} onClick={() => setMode('trending')}>
             Trending
@@ -86,7 +91,7 @@ export function RedditPanel({ onSelectSymbol }: Props) {
           </ModeButton>
         </div>
         {mode === 'trending' && (
-          <div className="flex gap-1 ml-auto">
+          <div className="flex gap-1">
             {WINDOWS.map((w) => (
               <button
                 key={w}
@@ -105,10 +110,27 @@ export function RedditPanel({ onSelectSymbol }: Props) {
           </div>
         )}
         {mode === 'diamonds' && (
-          <span className="ml-auto text-xs text-slate-500">
-            6h spike vs. 7d baseline
-          </span>
+          <span className="text-xs text-slate-500">6h spike vs. 7d baseline</span>
         )}
+        <div className="ml-auto flex items-center gap-2">
+          {scrapeStatus && (
+            <span className="hidden sm:inline text-xs text-emerald-400">{scrapeStatus}</span>
+          )}
+          <button
+            type="button"
+            onClick={handleRefresh}
+            disabled={scraping}
+            className={
+              'px-2.5 py-1 text-xs rounded border border-slate-700 ' +
+              (scraping
+                ? 'text-slate-500 cursor-not-allowed'
+                : 'text-slate-200 hover:bg-slate-800 hover:border-slate-600')
+            }
+            title="Run a fresh Reddit scrape now"
+          >
+            {scraping ? 'Scraping…' : 'Refresh'}
+          </button>
+        </div>
       </div>
 
       {error && (

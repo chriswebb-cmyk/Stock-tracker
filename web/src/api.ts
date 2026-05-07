@@ -87,4 +87,8 @@ export const api = {
         ? `/reddit/posts?symbol=${encodeURIComponent(symbol)}&limit=${limit}`
         : `/reddit/posts?limit=${limit}`,
     ),
+  redditScrape: () =>
+    getJson<{ subreddits: string[]; postsSeen: number; postsNew: number; mentions: number; errors: number }>(
+      '/reddit/scrape',
+    ),
 };
