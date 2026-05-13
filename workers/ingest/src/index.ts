@@ -190,12 +190,12 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
   }
 
   // For symbols Yahoo couldn't serve, try Finnhub /quote sequentially since
-  // it's rate-limited. Skip the fallback entirely if the Yahoo failure rate
-  // is high (>40% of the chunk) — that's a Yahoo-wide issue and trying 20+
-  // serial Finnhub calls would blow the wall-clock budget. Next chunk will
-  // try Yahoo again with a clean slate.
+  // it's rate-limited. Skip the fallback only on near-total Yahoo wipeouts
+  // (>70% failure) — that's a Yahoo-wide issue where 20+ serial Finnhub
+  // calls would blow the wall-clock budget. Below that, partial fallback
+  // is better than dropping the data entirely.
   const yahooFailRate = symbols.length > 0 ? failedSymbols.length / symbols.length : 0;
-  const shouldFinnhubFallback = finnhub !== null && yahooFailRate <= 0.4;
+  const shouldFinnhubFallback = finnhub !== null && yahooFailRate <= 0.7;
   if (shouldFinnhubFallback) {
     for (const symbol of failedSymbols) {
       try {

@@ -1,6 +1,13 @@
 import type { Bar, BarInterval } from '../../../shared/types';
 
-const BASE = 'https://query1.finance.yahoo.com/v8/finance/chart';
+// Two Yahoo edge hosts. They rate-limit independently — when query1 starts
+// returning 429 for our IP, query2 often still works for a while. The client
+// rotates through them and retries once on transient failures before giving
+// up on a symbol.
+const HOSTS = [
+  'https://query1.finance.yahoo.com/v8/finance/chart',
+  'https://query2.finance.yahoo.com/v8/finance/chart',
+];
 
 export class YahooError extends Error {
   constructor(message: string) {
@@ -54,7 +61,33 @@ const YAHOO_INTERVAL: Record<BarInterval, string> = {
 
 export class YahooClient {
   async chart(symbol: string, interval: BarInterval, range: string, timeoutMs = 6_000): Promise<YahooFetchResult> {
-    const url = new URL(`${BASE}/${encodeURIComponent(symbol)}`);
+    // Try each host once, then back off and retry once more. Total worst-case
+    // wall-clock is ~4 * timeoutMs + 250ms; with timeoutMs=6s that's 24s,
+    // still inside the cron's 30s budget per symbol when called serially.
+    // Practical case: 99% of calls succeed on the first host on the first try.
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      for (const base of HOSTS) {
+        try {
+          return await this.tryOnce(base, symbol, interval, range, timeoutMs);
+        } catch (err) {
+          lastErr = err;
+          if (!isTransient(err)) throw err;
+        }
+      }
+      if (attempt === 0) await sleep(250);
+    }
+    throw lastErr instanceof Error ? lastErr : new YahooError(`Yahoo failed for ${symbol}`);
+  }
+
+  private async tryOnce(
+    base: string,
+    symbol: string,
+    interval: BarInterval,
+    range: string,
+    timeoutMs: number,
+  ): Promise<YahooFetchResult> {
+    const url = new URL(`${base}/${encodeURIComponent(symbol)}`);
     url.searchParams.set('interval', YAHOO_INTERVAL[interval]);
     url.searchParams.set('range', range);
     url.searchParams.set('includePrePost', 'false');
@@ -141,4 +174,17 @@ export class YahooClient {
   latest(symbol: string, interval: BarInterval = '1min'): Promise<YahooFetchResult> {
     return this.chart(symbol, interval, '2d');
   }
+}
+
+// Treat transient failures (rate-limit, timeout, 5xx) as retryable. 4xx
+// other than 429 are real client errors and shouldn't be retried.
+function isTransient(err: unknown): boolean {
+  if (!(err instanceof YahooError)) return true;
+  const msg = err.message;
+  if (/rate limit|timeout|HTTP 5\d\d/.test(msg)) return true;
+  return false;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
