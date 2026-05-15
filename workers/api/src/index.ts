@@ -1069,72 +1069,81 @@ async function getOptionsChain(
     // Fall through to live fetch.
   }
 
-  // Yahoo's options endpoint is fussier about clients than its chart
-  // endpoint and has been returning 401 for generic User-Agents. Rotate
-  // between the two hosts and send realistic browser headers.
-  const hosts = ['https://query2.finance.yahoo.com', 'https://query1.finance.yahoo.com'];
-  const dateParam = expirationTs ? `&date=${expirationTs}` : '';
-  const yahooPath = `/v7/finance/options/${encodeURIComponent(symbol)}?lang=en-US&region=US${dateParam}`;
-  const browserHeaders = {
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    Accept: 'application/json,text/plain,*/*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    Referer: 'https://finance.yahoo.com/',
-    Origin: 'https://finance.yahoo.com',
-  };
-  let res: Response | null = null;
-  let lastStatus = 0;
-  for (const host of hosts) {
-    const r = await fetch(`${host}${yahooPath}`, { headers: browserHeaders, signal: AbortSignal.timeout(8_000) });
-    if (r.ok) {
-      res = r;
-      break;
+  // Try Finnhub first (we already have the API key, it returns greeks
+  // pre-computed, single response includes all expirations). Fall back to
+  // Yahoo if Finnhub is paid-tier-gated for this account.
+  const finnhubResult = env.FINNHUB_API_KEY
+    ? await tryFinnhubChain(env.FINNHUB_API_KEY, symbol, expirationTs)
+    : null;
+
+  let response: OptionsChainResponse;
+  if (finnhubResult) {
+    response = finnhubResult;
+  } else {
+    // Yahoo fallback. Their v7 endpoint is fussier than the chart endpoint;
+    // send realistic browser headers and rotate hosts to dodge 401s.
+    const hosts = ['https://query2.finance.yahoo.com', 'https://query1.finance.yahoo.com'];
+    const dateParam = expirationTs ? `&date=${expirationTs}` : '';
+    const yahooPath = `/v7/finance/options/${encodeURIComponent(symbol)}?lang=en-US&region=US${dateParam}`;
+    const browserHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      Accept: 'application/json,text/plain,*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      Referer: 'https://finance.yahoo.com/',
+      Origin: 'https://finance.yahoo.com',
+    };
+    let res: Response | null = null;
+    let lastStatus = 0;
+    for (const host of hosts) {
+      const r = await fetch(`${host}${yahooPath}`, { headers: browserHeaders, signal: AbortSignal.timeout(8_000) });
+      if (r.ok) {
+        res = r;
+        break;
+      }
+      lastStatus = r.status;
     }
-    lastStatus = r.status;
+    if (!res) {
+      throw new HttpError(
+        lastStatus || 502,
+        `Both options sources failed for ${symbol}. Yahoo returned ${lastStatus}; Finnhub likely needs paid tier on your account.`,
+      );
+    }
+    const json = (await res.json()) as YahooOptionsResponse;
+    const result = json.optionChain?.result?.[0];
+    if (!result) throw new HttpError(502, `no chain returned for ${symbol}`);
+    const opt = result.options?.[0];
+    if (!opt) throw new HttpError(502, `no options block for ${symbol}`);
+
+    const spot = result.quote?.regularMarketPrice ?? 0;
+    const expiration = opt.expirationDate;
+    const expirationDate = new Date(expiration * 1000).toISOString().slice(0, 10);
+    const daysToExpiry = Math.max(0, (expiration - now) / 86400);
+
+    let rate = 0.045;
+    try {
+      const tnx = await env.DB
+        .prepare(`SELECT close FROM bars WHERE symbol='^TNX' AND interval='1min' ORDER BY ts DESC LIMIT 1`)
+        .first<{ close: number }>();
+      if (tnx && tnx.close > 0) rate = tnx.close / 100;
+    } catch {
+      // Stick with default rate.
+    }
+
+    const yearsToExpiry = daysToExpiry / 365;
+    const calls = (opt.calls ?? []).map((c) => toContract(c, spot, rate, yearsToExpiry, 'call'));
+    const puts = (opt.puts ?? []).map((c) => toContract(c, spot, rate, yearsToExpiry, 'put'));
+
+    response = {
+      symbol,
+      spot,
+      expiration,
+      expirationDate,
+      daysToExpiry: Math.round(daysToExpiry * 10) / 10,
+      availableExpirations: result.expirationDates ?? [],
+      calls,
+      puts,
+    };
   }
-  if (!res) {
-    throw new HttpError(
-      lastStatus || 502,
-      `Yahoo options ${lastStatus} for ${symbol} — they're blocking unauthenticated options requests. Switch to Tradier (free signup) if this persists.`,
-    );
-  }
-  const json = (await res.json()) as YahooOptionsResponse;
-  const result = json.optionChain?.result?.[0];
-  if (!result) throw new HttpError(502, `no chain returned for ${symbol}`);
-  const opt = result.options?.[0];
-  if (!opt) throw new HttpError(502, `no options block for ${symbol}`);
-
-  const spot = result.quote?.regularMarketPrice ?? 0;
-  const expiration = opt.expirationDate;
-  const expirationDate = new Date(expiration * 1000).toISOString().slice(0, 10);
-  const daysToExpiry = Math.max(0, (expiration - now) / 86400);
-
-  // Get current risk-free rate from latest ^TNX close. ^TNX is reported
-  // as a percentage (e.g. 4.35 = 4.35%), so divide by 100.
-  let rate = 0.045; // sensible default if ^TNX unavailable
-  try {
-    const tnx = await env.DB
-      .prepare(`SELECT close FROM bars WHERE symbol='^TNX' AND interval='1min' ORDER BY ts DESC LIMIT 1`)
-      .first<{ close: number }>();
-    if (tnx && tnx.close > 0) rate = tnx.close / 100;
-  } catch {
-    // Stick with default rate.
-  }
-
-  const yearsToExpiry = daysToExpiry / 365;
-  const calls = (opt.calls ?? []).map((c) => toContract(c, spot, rate, yearsToExpiry, 'call'));
-  const puts = (opt.puts ?? []).map((c) => toContract(c, spot, rate, yearsToExpiry, 'put'));
-
-  const response: OptionsChainResponse = {
-    symbol,
-    spot,
-    expiration,
-    expirationDate,
-    daysToExpiry: Math.round(daysToExpiry * 10) / 10,
-    availableExpirations: result.expirationDates ?? [],
-    calls,
-    puts,
-  };
 
   try {
     await env.DB
@@ -1176,6 +1185,108 @@ interface YahooContractRaw {
   openInterest?: number;
   impliedVolatility?: number;
   inTheMoney?: boolean;
+}
+
+interface FinnhubOptionsResponse {
+  data?: Array<{
+    expirationDate?: string; // 'YYYY-MM-DD'
+    options?: {
+      CALL?: FinnhubContractRaw[];
+      PUT?: FinnhubContractRaw[];
+    };
+  }>;
+  symbol?: string;
+}
+
+interface FinnhubContractRaw {
+  contractName?: string;
+  strike?: number;
+  lastPrice?: number;
+  volume?: number;
+  openInterest?: number;
+  bid?: number;
+  ask?: number;
+  impliedVolatility?: number;
+  delta?: number;
+  gamma?: number;
+  theta?: number;
+  vega?: number;
+  inTheMoney?: string; // 'TRUE' / 'FALSE'
+}
+
+// Finnhub options chain. Returns null when the endpoint is paid-tier-gated
+// or otherwise unavailable, so the caller can fall through to Yahoo.
+async function tryFinnhubChain(
+  apiKey: string,
+  symbol: string,
+  expirationTs: number | null,
+): Promise<OptionsChainResponse | null> {
+  try {
+    const url = `https://finnhub.io/api/v1/stock/option-chain?symbol=${encodeURIComponent(symbol)}&token=${apiKey}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+    // Free tier sometimes returns 200 with an empty payload, sometimes 403.
+    if (!res.ok) return null;
+    const json = (await res.json()) as FinnhubOptionsResponse;
+    const expirations = (json.data ?? []).filter((d) => d.expirationDate);
+    if (expirations.length === 0) return null;
+
+    // Pick the requested expiration or the nearest one.
+    const wantedDate = expirationTs
+      ? new Date(expirationTs * 1000).toISOString().slice(0, 10)
+      : null;
+    const picked = wantedDate
+      ? expirations.find((d) => d.expirationDate === wantedDate) ?? expirations[0]!
+      : expirations[0]!;
+    if (!picked.options) return null;
+
+    const expirationDate = picked.expirationDate!;
+    const expirationUnix = Math.floor(Date.parse(expirationDate + 'T20:00:00Z') / 1000);
+    const nowSec = Math.floor(Date.now() / 1000);
+    const daysToExpiry = Math.max(0, (expirationUnix - nowSec) / 86400);
+
+    const toC = (c: FinnhubContractRaw): OptionContract => ({
+      contractSymbol: c.contractName ?? '',
+      strike: c.strike ?? 0,
+      bid: typeof c.bid === 'number' ? c.bid : null,
+      ask: typeof c.ask === 'number' ? c.ask : null,
+      last: typeof c.lastPrice === 'number' ? c.lastPrice : null,
+      volume: typeof c.volume === 'number' ? c.volume : null,
+      openInterest: typeof c.openInterest === 'number' ? c.openInterest : null,
+      impliedVolatility: typeof c.impliedVolatility === 'number' ? c.impliedVolatility : null,
+      inTheMoney: c.inTheMoney === 'TRUE',
+      delta: typeof c.delta === 'number' ? c.delta : null,
+      gamma: typeof c.gamma === 'number' ? c.gamma : null,
+      theta: typeof c.theta === 'number' ? c.theta : null,
+      vega: typeof c.vega === 'number' ? c.vega : null,
+    });
+
+    const calls = (picked.options.CALL ?? []).map(toC).sort((a, b) => a.strike - b.strike);
+    const puts = (picked.options.PUT ?? []).map(toC).sort((a, b) => a.strike - b.strike);
+
+    // Approximate spot from ATM strike (where call delta ≈ 0.5). Finnhub
+    // doesn't return the underlying spot in the same payload.
+    let spot = 0;
+    const atm = calls.find((c) => c.delta !== null && c.delta > 0.5);
+    if (atm && atm.strike > 0) spot = atm.strike;
+    else if (calls.length > 0) spot = calls[Math.floor(calls.length / 2)]!.strike;
+
+    const availableExpirations = expirations.map((d) =>
+      Math.floor(Date.parse(d.expirationDate! + 'T20:00:00Z') / 1000),
+    );
+
+    return {
+      symbol,
+      spot,
+      expiration: expirationUnix,
+      expirationDate,
+      daysToExpiry: Math.round(daysToExpiry * 10) / 10,
+      availableExpirations,
+      calls,
+      puts,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function toContract(
