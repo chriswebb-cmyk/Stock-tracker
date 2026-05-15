@@ -118,6 +118,11 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
     : tickers.filter((_, i) => i % numChunks === chunkIdx);
 
   const runId = await startIngestRun(env.DB);
+  // Hard wall-clock deadline for the cron invocation. Cloudflare's
+  // scheduled() handler is capped at 30s; we set ours below that so the
+  // finally block writes the run row even when external APIs misbehave.
+  const runStart = Date.now();
+  const DEADLINE_MS = 22_000;
   const yahoo = new YahooClient();
   const finnhub = env.FINNHUB_API_KEY ? new FinnhubClient(env.FINNHUB_API_KEY) : null;
   const finnhubLimiter = new RateLimiter(Number(env.FINNHUB_REQUESTS_PER_MINUTE ?? '60'));
@@ -213,6 +218,16 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
   const shouldFinnhubFallback = finnhub !== null && yahooFailRate <= 0.7;
   if (shouldFinnhubFallback) {
     for (const symbol of failedSymbols) {
+      // Cron-level deadline guard. If Yahoo already burned most of the
+      // wall-clock budget, stop here so finishIngestRun has a chance to
+      // run. The skipped symbols are recorded as errors so we can see
+      // what got dropped.
+      if (Date.now() - runStart > DEADLINE_MS) {
+        const remaining = failedSymbols.length - (yahooOk + finnhubFallback - yahooOk);
+        const note = `finnhub-skip: deadline ${DEADLINE_MS}ms reached, ${remaining} symbols pending`;
+        errorText = errorText ? `${errorText}\n${note}` : note;
+        break;
+      }
       try {
         await finnhubLimiter.take(1);
         const result = await finnhub!.quoteBar(symbol, '1min', now);
@@ -251,12 +266,15 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
   // Build per-scan context once: VIX/TNX/SPY are global; Reddit, options
   // and earnings are per-symbol. Best-effort — any query failure leaves the
   // corresponding context fields neutral so signal detection still runs.
-  const vixCtx = await loadIndexContext(env.DB, '^VIX', 'vix');
-  const tnxCtx = await loadIndexContext(env.DB, '^TNX', 'tnx');
-  const spyCtx = await loadSpyContext(env.DB);
-  const redditBySymbol = await loadRedditContext(env.DB, symbols);
-  const optionsBySymbol = await loadOptionsContext(env.DB, symbols);
-  const earningsBySymbol = await loadEarningsContext(env, symbols);
+  // Fanned out concurrently to save 5-6 D1 round-trips of serial wall-clock.
+  const [vixCtx, tnxCtx, spyCtx, redditBySymbol, optionsBySymbol, earningsBySymbol] = await Promise.all([
+    loadIndexContext(env.DB, '^VIX', 'vix'),
+    loadIndexContext(env.DB, '^TNX', 'tnx'),
+    loadSpyContext(env.DB),
+    loadRedditContext(env.DB, symbols),
+    loadOptionsContext(env.DB, symbols),
+    loadEarningsContext(env, symbols),
+  ]);
 
   // In-memory setup detection per symbol.
   const signalsToFire: DiscordSignal[] = [];

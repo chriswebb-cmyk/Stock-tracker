@@ -60,22 +60,21 @@ const YAHOO_INTERVAL: Record<BarInterval, string> = {
 };
 
 export class YahooClient {
-  async chart(symbol: string, interval: BarInterval, range: string, timeoutMs = 6_000): Promise<YahooFetchResult> {
-    // Try each host once, then back off and retry once more. Total worst-case
-    // wall-clock is ~4 * timeoutMs + 250ms; with timeoutMs=6s that's 24s,
-    // still inside the cron's 30s budget per symbol when called serially.
-    // Practical case: 99% of calls succeed on the first host on the first try.
+  async chart(symbol: string, interval: BarInterval, range: string, timeoutMs = 5_000): Promise<YahooFetchResult> {
+    // Try each host once. Worst case = 2 hosts * timeoutMs = ~10s per failed
+    // symbol; with Promise.allSettled fanning symbols out in parallel, the
+    // total Yahoo-phase wall-clock stays bounded near 10s even when every
+    // symbol fails on both hosts. (Previous double-loop with 250ms sleep
+    // could reach ~24s per symbol and blew the cron's 30s budget when
+    // peak-load Yahoo throttling hit Cloudflare's egress pool.)
     let lastErr: unknown = null;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      for (const base of HOSTS) {
-        try {
-          return await this.tryOnce(base, symbol, interval, range, timeoutMs);
-        } catch (err) {
-          lastErr = err;
-          if (!isTransient(err)) throw err;
-        }
+    for (const base of HOSTS) {
+      try {
+        return await this.tryOnce(base, symbol, interval, range, timeoutMs);
+      } catch (err) {
+        lastErr = err;
+        if (!isTransient(err)) throw err;
       }
-      if (attempt === 0) await sleep(250);
     }
     throw lastErr instanceof Error ? lastErr : new YahooError(`Yahoo failed for ${symbol}`);
   }
@@ -193,6 +192,3 @@ function isTransient(err: unknown): boolean {
   return false;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
