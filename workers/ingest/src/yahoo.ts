@@ -166,6 +166,14 @@ export class YahooClient {
     const prevClose = result.meta.chartPreviousClose ?? result.meta.previousClose ?? null;
     const current = result.meta.regularMarketPrice ?? lastClose;
 
+    // Yahoo sometimes returns HTTP 200 with an empty timestamp/quote array
+    // for symbols it's silently throttling. Treat that as a failure so the
+    // caller (runIngest) knows to try Finnhub as fallback rather than
+    // logging false success and writing zero rows.
+    if (bars.length === 0) {
+      throw new YahooError(`Yahoo returned empty bars for ${symbol}`);
+    }
+
     return { bars, prevClose, current, dayHigh, dayLow, dayOpen };
   }
 
