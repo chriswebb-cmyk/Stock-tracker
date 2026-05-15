@@ -8,6 +8,7 @@ import { StatusBar } from './components/StatusBar';
 import { BacktestPanel } from './components/BacktestPanel';
 import { MlPanel } from './components/MlPanel';
 import { RedditPanel } from './components/RedditPanel';
+import { NewsPanel } from './components/NewsPanel';
 
 const INTERVALS: BarInterval[] = ['1min', '5min', '15min', '60min'];
 
@@ -155,8 +156,13 @@ export default function App() {
 
             <IndicatorPanel bars={bars} />
 
-            <div className="flex-1 min-h-0">
-              <PriceChart bars={bars} signals={signals} />
+            <div className="flex-1 min-h-0 grid grid-rows-[1fr_auto] md:grid-rows-[1fr_240px]">
+              <div className="min-h-0">
+                <PriceChart bars={bars} signals={signals} />
+              </div>
+              <div className="border-t border-slate-800 min-h-0 max-h-[240px] overflow-hidden">
+                <NewsPanel symbol={selected} />
+              </div>
             </div>
           </main>
         </div>

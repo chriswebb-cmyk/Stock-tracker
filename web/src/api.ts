@@ -30,11 +30,36 @@ export interface BacktestSummary {
 
 export interface ModelRow {
   setup: string;
+  hold_minutes: number;
   trained_at: number;
   sample_count: number;
   train_accuracy: number;
   val_accuracy: number;
   train_baseline: number;
+}
+
+export interface MetaModelRow {
+  hold_minutes: number;
+  trained_at: number;
+  sample_count: number;
+  train_accuracy: number;
+  val_accuracy: number;
+  train_baseline: number;
+}
+
+export interface ModelsResponse {
+  perSetup: ModelRow[];
+  meta: MetaModelRow[];
+}
+
+export interface NewsItem {
+  id: number;
+  headline: string;
+  summary: string;
+  source: string;
+  url: string;
+  datetime: number; // unix seconds
+  image?: string;
 }
 
 export interface SignalRow {
@@ -66,7 +91,9 @@ export const api = {
     getJson<BacktestResult>(
       `/backtest/${encodeURIComponent(symbol)}?days=${days}&hold=${hold}${includeTrades ? '&trades=1' : ''}`,
     ),
-  models: () => getJson<ModelRow[]>('/ml/models'),
+  models: () => getJson<ModelsResponse>('/ml/models'),
+  news: (symbol: string, limit = 20) =>
+    getJson<NewsItem[]>(`/news/${encodeURIComponent(symbol)}?limit=${limit}`),
   signals: (limit = 50) => getJson<SignalRow[]>(`/signals?limit=${limit}`),
   signalsForSymbol: (symbol: string, days = 7) =>
     getJson<SignalRow[]>(`/signals/by-symbol/${encodeURIComponent(symbol)}?days=${days}`),

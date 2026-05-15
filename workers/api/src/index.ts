@@ -21,6 +21,9 @@ export interface Env {
   // Service binding to the reddit scraper worker (defined in wrangler.toml).
   // /reddit/scrape proxies to it so the dashboard can trigger a scrape.
   REDDIT?: Fetcher;
+  // Finnhub API key. Used for company news (/news/:symbol). When unset,
+  // /news returns 503; the dashboard handles that gracefully.
+  FINNHUB_API_KEY?: string;
 }
 
 const VALID_INTERVALS: BarInterval[] = ['1min', '5min', '15min', '30min', '60min'];
@@ -162,6 +165,15 @@ async function route(url: URL, request: Request, env: Env): Promise<unknown> {
     const limit = clampInt(url.searchParams.get('limit'), 1, 100, 25);
     const subreddit = url.searchParams.get('subreddit');
     return getRedditPosts(env.DB, symbol, limit, subreddit);
+  }
+
+  // Company news for a symbol via Finnhub. Cached in json_cache for 30
+  // minutes so we don't burn through the free tier on every chart load.
+  const newsMatch = path.match(/^\/news\/([A-Za-z.^\-]+)$/);
+  if (newsMatch && request.method === 'GET') {
+    const symbol = newsMatch[1]!.toUpperCase();
+    const limit = clampInt(url.searchParams.get('limit'), 1, 50, 20);
+    return getCompanyNews(env, symbol, limit);
   }
 
   // Triggers an on-demand scrape on the reddit worker via the service
@@ -439,6 +451,80 @@ async function getCachedBacktestSummary(
   const fresh = await getBacktestSummary(db, days, holdMinutes, cooldownSec);
   await writeCache(db, key, JSON.stringify(fresh));
   return { ...fresh, cachedAt: Math.floor(Date.now() / 1000), stale: false };
+}
+
+interface NewsItem {
+  id: number;
+  headline: string;
+  summary: string;
+  source: string;
+  url: string;
+  datetime: number;
+  image?: string;
+}
+
+// Fetch company news for a symbol. 30-minute cache in json_cache so a
+// page refresh hitting 47 tickers doesn't blow Finnhub's free-tier
+// 60 req/min budget.
+async function getCompanyNews(env: Env, symbol: string, limit: number): Promise<NewsItem[]> {
+  if (!env.FINNHUB_API_KEY) {
+    throw new HttpError(503, 'FINNHUB_API_KEY not configured on api worker');
+  }
+  const key = `news-${symbol}`;
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    const row = await env.DB
+      .prepare('SELECT value, updated_at FROM json_cache WHERE key = ?')
+      .bind(key)
+      .first<{ value: string; updated_at: number }>();
+    if (row && now - row.updated_at < 30 * 60) {
+      return (JSON.parse(row.value) as NewsItem[]).slice(0, limit);
+    }
+  } catch {
+    // Cache lookup failure shouldn't break the request; fall through to live fetch.
+  }
+  // Finnhub /company-news returns recent news with sentiment; we trim
+  // payload to fields the dashboard renders.
+  const to = new Date(now * 1000).toISOString().slice(0, 10);
+  const from = new Date((now - 7 * 86400) * 1000).toISOString().slice(0, 10);
+  // ^VIX / ^TNX aren't tradeable equities; Finnhub returns 404. Strip the
+  // caret so we get the index proxy news (e.g. ^VIX -> VIX).
+  const finnhubSym = symbol.replace(/^\^/, '');
+  const u = `https://finnhub.io/api/v1/company-news?symbol=${encodeURIComponent(finnhubSym)}&from=${from}&to=${to}&token=${env.FINNHUB_API_KEY}`;
+  let news: NewsItem[] = [];
+  try {
+    const res = await fetch(u, { signal: AbortSignal.timeout(8_000) });
+    if (res.ok) {
+      const raw = (await res.json()) as Array<{
+        id: number; headline: string; summary: string; source: string;
+        url: string; datetime: number; image?: string;
+      }>;
+      news = raw.map((n) => ({
+        id: n.id,
+        headline: n.headline,
+        summary: n.summary,
+        source: n.source,
+        url: n.url,
+        datetime: n.datetime,
+        image: n.image,
+      }));
+    }
+  } catch {
+    // Upstream failures fall through to returning an empty cache write so
+    // we don't hammer Finnhub on repeated failures.
+  }
+  try {
+    await env.DB
+      .prepare(
+        `INSERT INTO json_cache(key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+      )
+      .bind(key, JSON.stringify(news), now)
+      .run();
+  } catch {
+    // Best-effort cache write.
+  }
+  return news.slice(0, limit);
 }
 
 async function writeCache(db: D1Database, key: string, value: string): Promise<void> {
