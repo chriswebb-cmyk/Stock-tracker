@@ -460,9 +460,14 @@ async function getBacktestSummary(
     .prepare('SELECT symbol FROM tickers WHERE enabled = 1 ORDER BY symbol')
     .all<{ symbol: string }>();
   const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+  const symbolBars = await Promise.all(
+    tickers.results.map(async ({ symbol }) => ({
+      symbol,
+      bars: await loadBarsSince(db, symbol, '1min', sinceTs),
+    })),
+  );
   const results: BacktestResult[] = [];
-  for (const { symbol } of tickers.results) {
-    const bars = await loadBarsSince(db, symbol, '1min', sinceTs);
+  for (const { symbol, bars } of symbolBars) {
     if (bars.length < 30) continue;
     results.push(backtest(symbol, bars, holdMinutes, cooldownSec));
   }
@@ -493,8 +498,16 @@ async function trainModels(
   let totalTrades = 0;
   let symbolsUsed = 0;
 
-  for (const { symbol } of tickers.results) {
-    const bars = await loadBarsSince(db, symbol, '1min', sinceTs);
+  // Fan out bar loading concurrently — serial loading was burning seconds
+  // of wall-clock budget on D1 round-trips with nothing else happening.
+  const symbolBars = await Promise.all(
+    tickers.results.map(async ({ symbol }) => ({
+      symbol,
+      bars: await loadBarsSince(db, symbol, '1min', sinceTs),
+    })),
+  );
+
+  for (const { symbol, bars } of symbolBars) {
     if (bars.length < 30) continue;
     symbolsUsed += 1;
     const result = backtest(symbol, bars, holdMinutes, cooldownSec);

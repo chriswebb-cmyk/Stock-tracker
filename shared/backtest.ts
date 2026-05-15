@@ -9,7 +9,6 @@ import {
   rsi,
   trendStrength,
   volRegime,
-  vpocToday,
   vwap,
 } from './indicators';
 import type { DetectedSignal, SetupName } from './setups';
@@ -71,10 +70,10 @@ interface DayInfo {
   orbReadyIndex: number;
   brokeUp: boolean;
   brokeDown: boolean;
-  // Full-day high/low filled in after days[] is built; used to expose
-  // prior-day H/L as features.
   priorHigh: number;
   priorLow: number;
+  dayOpen: number;
+  vpoc: number; // full-day VPOC. Used by the NEXT day's trades (no lookahead).
 }
 
 export function backtest(
@@ -127,6 +126,8 @@ export function backtest(
         brokeDown: false,
         priorHigh: -Infinity,
         priorLow: Infinity,
+        dayOpen: curBar.open,
+        vpoc: NaN,
       });
     }
   }
@@ -134,7 +135,7 @@ export function backtest(
   for (let d = 0; d < days.length; d++) {
     const day = days[d]!;
     const dayEnd = d + 1 < days.length ? days[d + 1]!.startIndex : bars.length;
-    // Full-day high/low (used for prior-day features by the NEXT day).
+    // Single pass: full-day H/L, ORB H/L, day open, volume histogram for VPOC.
     let dh = -Infinity;
     let dl = Infinity;
     for (let i = day.startIndex; i < dayEnd; i++) {
@@ -144,7 +145,29 @@ export function backtest(
     }
     day.priorHigh = dh;
     day.priorLow = dl;
-    // ORB high/low using just the first ORB_MINUTES bars.
+    // VPOC: 50-bin volume histogram over the day's price range, find peak bin.
+    if (dh > dl) {
+      const BIN_COUNT = 50;
+      const binSize = (dh - dl) / BIN_COUNT;
+      const bins = new Array<number>(BIN_COUNT + 1).fill(0);
+      for (let i = day.startIndex; i < dayEnd; i++) {
+        const b = bars[i]!;
+        const startBin = Math.max(0, Math.floor((b.low - dl) / binSize));
+        const endBin = Math.min(BIN_COUNT, Math.floor((b.high - dl) / binSize));
+        const spanBins = Math.max(1, endBin - startBin + 1);
+        const volPerBin = b.volume / spanBins;
+        for (let k = startBin; k <= endBin; k++) bins[k]! += volPerBin;
+      }
+      let bestIdx = 0;
+      let bestVol = -1;
+      for (let k = 0; k < bins.length; k++) {
+        if (bins[k]! > bestVol) {
+          bestVol = bins[k]!;
+          bestIdx = k;
+        }
+      }
+      day.vpoc = dl + (bestIdx + 0.5) * binSize;
+    }
     const orbEnd = Math.min(day.startIndex + ORB_MINUTES, dayEnd);
     for (let i = day.startIndex; i < orbEnd; i++) {
       const b = bars[i]!;
@@ -194,14 +217,12 @@ export function backtest(
     const regime = volRegime(bars, atrSeries, entryIndex, VOL_REGIME_LOOKBACK);
     const ema5 = mtf5[entryIndex];
     const ema15 = mtf15[entryIndex];
-    // Structural per-trade features. Compute against bars up to entryIndex
-    // so we don't lookahead into bars the live signal wouldn't have seen.
-    const barsUpTo = bars.slice(0, entryIndex + 1);
-    const todayBars = barsUpTo.filter((b) => etDayKey(b.ts) === dayKeys[entryIndex]);
-    const todayOpen = todayBars[0]?.open;
-    const vpoc = vpocToday(barsUpTo, etDayKey);
-    const trend = trendStrength(barsUpTo, 60, 3);
+    // Structural features come from precomputed per-day metrics in days[],
+    // so this is O(1) per trade instead of O(N) bar-slicing + filtering.
+    // Using PRIOR day's VPOC (not current) avoids lookahead bias — the
+    // current day's POC isn't knowable until the close.
     const prior = dayIdx > 0 ? days[dayIdx - 1]! : null;
+    const trend = trendStrength(bars, 60, 3, entryIndex + 1);
     const features = buildFeatures({
       close: entryBar.close,
       prevClose: day.prevClose,
@@ -215,8 +236,8 @@ export function backtest(
       pdh: prior?.priorHigh,
       pdl: prior?.priorLow,
       pdClose: day.prevClose,
-      todayOpen,
-      vpoc: isNum(vpoc) ? vpoc : undefined,
+      todayOpen: day.dayOpen,
+      vpoc: prior && isNum(prior.vpoc) ? prior.vpoc : undefined,
       trendStrength: trend,
       // VIX/Reddit/Options/SPY/TNX/earnings context isn't historically
       // available in backtest; those features fall back to neutral defaults.

@@ -228,13 +228,15 @@ export function vpocToday(bars: Bar[], dayKey: (ts: number) => string): number {
   return lo + (bestIdx + 0.5) * binSize;
 }
 
-// Trend strength: simple swing detector over the last `lookback` bars.
-// Scans for local highs / lows (each higher than its `pivot` neighbours on
-// both sides) and counts higher-highs / higher-lows minus lower-highs /
-// lower-lows. Result normalised to [-1, 1] by total swing count. Captures
-// directional pressure that EMAs alone miss.
-export function trendStrength(bars: Bar[], lookback = 60, pivot = 3): number {
-  const end = bars.length;
+// Trend strength: simple swing detector over the `lookback` bars ending at
+// `endIndex` (default: end of bars). Scans for local highs / lows (each
+// higher/lower than its `pivot` neighbours on both sides) and counts
+// higher-highs / higher-lows minus lower-highs / lower-lows. Result
+// normalised to [-1, 1] by total swing count. Captures directional
+// pressure that EMAs alone miss. endIndex is exclusive so backtest can
+// avoid lookahead.
+export function trendStrength(bars: Bar[], lookback = 60, pivot = 3, endIndex?: number): number {
+  const end = endIndex ?? bars.length;
   const start = Math.max(pivot, end - lookback);
   const highs: number[] = [];
   const lows: number[] = [];
