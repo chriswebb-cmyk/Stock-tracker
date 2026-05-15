@@ -1,5 +1,5 @@
 import type { Bar } from './types';
-import { atr, bollinger, etDayKey, isNum, rsi, vwap } from './indicators';
+import { atr, bollinger, etDayKey, isNum, rsi, volRegime, vwap } from './indicators';
 import type { DetectedSignal, SetupName } from './setups';
 import { buildFeatures, type FeatureName } from './features';
 
@@ -9,6 +9,10 @@ const SQUEEZE_PCTILE = 0.2;
 const SQUEEZE_RELEASE_MULT = 1.5;
 const RSI_OVERSOLD = 30;
 const RSI_OVERBOUGHT = 70;
+// Lookback for the volatility regime feature. 390 ≈ 1 US trading day of
+// 1-min bars; long enough to distinguish today's vol from a typical day,
+// short enough that recent regime shifts dominate stale history.
+const VOL_REGIME_LOOKBACK = 390;
 
 export interface BacktestTrade {
   symbol: string;
@@ -150,6 +154,7 @@ export function backtest(
     const lastRsi = rsiSeries[entryIndex] ?? 50;
     const bbBand = bbSeries[entryIndex];
     const lastAtr = atrSeries[entryIndex] ?? 0;
+    const regime = volRegime(bars, atrSeries, entryIndex, VOL_REGIME_LOOKBACK);
     const features = buildFeatures({
       close: entryBar.close,
       prevClose: day.prevClose,
@@ -159,6 +164,7 @@ export function backtest(
       bbUpper: bbBand && isNum(bbBand.upper) ? bbBand.upper : entryBar.close,
       atr: isNum(lastAtr) ? lastAtr : 0,
       ts: entryBar.ts,
+      volRegime: regime,
     });
     trades.push({
       symbol,

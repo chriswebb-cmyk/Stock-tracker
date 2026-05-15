@@ -151,3 +151,35 @@ export function etDayKey(tsSeconds: number): string {
   const day = String(d.getUTCDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
 }
+
+// Volatility regime: percentile rank of the most recent ATR/price ratio
+// against the same ratio over the trailing window. Returns 0..1 where 1 =
+// most volatile minute in the window, 0 = calmest. Used as an ML feature so
+// setups can be scored differently in calm vs. choppy markets — RSI mean
+// reversion historically works in low-vol regimes; BB squeeze releases and
+// breakouts work in higher-vol regimes.
+//
+// Lookback is in bars (not minutes) so the caller controls the horizon:
+// 390 bars ≈ 1 US trading day of 1-min data; 1950 ≈ 5 days.
+export function volRegime(
+  bars: Bar[],
+  atrSeries: number[],
+  endIndex: number,
+  lookbackBars: number,
+): number {
+  const start = Math.max(0, endIndex - lookbackBars + 1);
+  const ratios: number[] = [];
+  for (let i = start; i <= endIndex; i++) {
+    const b = bars[i];
+    const a = atrSeries[i];
+    if (!b || !isNum(a) || b.close <= 0) continue;
+    ratios.push(a / b.close);
+  }
+  // Need enough samples to compute a stable rank; below this, just return
+  // 0.5 (neutral) so a few warmup bars don't poison early signals.
+  if (ratios.length < 30) return 0.5;
+  const current = ratios[ratios.length - 1]!;
+  let below = 0;
+  for (const r of ratios) if (r < current) below++;
+  return below / ratios.length;
+}

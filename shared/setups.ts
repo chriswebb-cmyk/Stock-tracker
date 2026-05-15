@@ -1,5 +1,5 @@
 import type { Bar } from './types';
-import { atr, bollinger, etDayKey, isNum, rsi, vwap, type BollingerBand } from './indicators';
+import { atr, bollinger, etDayKey, isNum, rsi, volRegime, vwap, type BollingerBand } from './indicators';
 
 export type SetupName =
   | 'vwap_reclaim_long'
@@ -29,6 +29,7 @@ const SQUEEZE_PCTILE = 0.2;
 const SQUEEZE_RELEASE_MULT = 1.5;
 const RSI_OVERSOLD = 30;
 const RSI_OVERBOUGHT = 70;
+const VOL_REGIME_LOOKBACK = 390;
 
 export function detectSetups(symbol: string, bars: Bar[], prevClose: number): DetectedSignal[] {
   const out: DetectedSignal[] = [];
@@ -56,10 +57,12 @@ export function detectSetups(symbol: string, bars: Bar[], prevClose: number): De
 
   const changePct = prevClose > 0 ? (last.close - prevClose) / prevClose : 0;
 
+  const regime = volRegime(bars, atrSeries, i, VOL_REGIME_LOOKBACK);
   const baseFeatures: Record<string, number> = {
     close: last.close,
     prev_close: prevClose,
     change_pct: changePct,
+    vol_regime: regime,
   };
   if (isNum(lastVwap)) baseFeatures.vwap = lastVwap;
   if (isNum(lastRsi)) baseFeatures.rsi = lastRsi;

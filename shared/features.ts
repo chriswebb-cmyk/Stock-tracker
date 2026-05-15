@@ -10,6 +10,7 @@ export const FEATURE_NAMES = [
   'atr_ratio',
   'min_of_day',
   'dow_norm',
+  'vol_regime',
 ] as const;
 
 export type FeatureName = typeof FEATURE_NAMES[number];
@@ -23,6 +24,9 @@ export interface FeatureInput {
   bbUpper: number;
   atr: number;
   ts: number; // unix seconds, bar open time
+  // 0..1 percentile rank of recent ATR/price vs the trailing window. Caller
+  // computes via volRegime(); 0.5 if there isn't enough warmup history.
+  volRegime: number;
 }
 
 export function buildFeatures(opts: FeatureInput): Record<FeatureName, number> {
@@ -41,6 +45,7 @@ export function buildFeatures(opts: FeatureInput): Record<FeatureName, number> {
     min_of_day: Math.max(0, Math.min(389, minSinceOpen)) / 389,
     // Map Mon-Fri (1..5) to 0..1; weekend bars shouldn't appear but clamp anyway.
     dow_norm: Math.max(0, Math.min(1, (dow - 1) / 4)),
+    vol_regime: Math.max(0, Math.min(1, opts.volRegime)),
   };
 }
 
