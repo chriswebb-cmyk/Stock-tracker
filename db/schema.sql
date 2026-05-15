@@ -111,9 +111,11 @@ CREATE TABLE IF NOT EXISTS models (
   weights_json    TEXT NOT NULL  -- {featureNames, means, stds, weights, bias}
 );
 
--- Seed the default watchlist.
+-- Seed the default watchlist. ^VIX is included so the ingest worker pulls
+-- its bars too; the API worker uses the latest VIX close as a regime
+-- feature on every signal (calm vs. panic market filter).
 INSERT OR IGNORE INTO tickers(symbol) VALUES
-  ('SPY'), ('QQQ'), ('AAPL'), ('NVDA'), ('TSLA');
+  ('SPY'), ('QQQ'), ('AAPL'), ('NVDA'), ('TSLA'), ('^VIX');
 
 -- Reddit posts pulled from r/wallstreetbets (and any other subs we add). One
 -- row per Reddit post id ('t3_xxxx'), upserted on each scrape so score and

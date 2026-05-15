@@ -12,7 +12,7 @@ import {
 import { detectSetups } from '../../../shared/setups';
 import { postDiscordSignals, type DiscordSignal } from './discord';
 import { modelFromJson, predict, type Model } from '../../../shared/ml';
-import { featuresToVector } from '../../../shared/features';
+import { featuresToVector, type SignalContext } from '../../../shared/features';
 import type { Bar } from '../../../shared/types';
 import type { SetupName } from '../../../shared/setups';
 
@@ -233,6 +233,13 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
     await upsertBars(env.DB, allBars);
   }
 
+  // Build per-scan context once: VIX (shared), Reddit & options per symbol.
+  // These are best-effort — any query failure leaves context fields neutral
+  // so signal detection still runs.
+  const vixCtx = await loadVixContext(env.DB);
+  const redditBySymbol = await loadRedditContext(env.DB, symbols);
+  const optionsBySymbol = await loadOptionsContext(env.DB, symbols);
+
   // In-memory setup detection per symbol.
   const signalsToFire: DiscordSignal[] = [];
   const signalsToInsert: Array<{
@@ -247,7 +254,12 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
 
   for (const f of fetched) {
     if (f.bars.length < 30 || f.prevClose === null) continue;
-    const detected = detectSetups(f.symbol, f.bars, f.prevClose);
+    const symbolContext: SignalContext = {
+      ...vixCtx,
+      ...(redditBySymbol.get(f.symbol) ?? {}),
+      ...(optionsBySymbol.get(f.symbol) ?? {}),
+    };
+    const detected = detectSetups(f.symbol, f.bars, f.prevClose, symbolContext);
     for (const sig of detected) {
       if (disabled.has(sig.setup)) continue;
       signalsFound += 1;
@@ -322,6 +334,139 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
     suppressedByMl,
     barsWritten: allBars.length,
   };
+}
+
+// Fetch the latest two VIX closes from D1 so we can pass {level, delta}
+// to the signal detector. Empty object if VIX isn't in the watchlist or
+// hasn't been ingested yet.
+async function loadVixContext(db: D1Database): Promise<SignalContext> {
+  try {
+    const { results } = await db
+      .prepare(
+        `SELECT close FROM bars
+          WHERE symbol = '^VIX' AND interval = '1min'
+          ORDER BY ts DESC
+          LIMIT 2`,
+      )
+      .all<{ close: number }>();
+    if (results.length === 0) return {};
+    const latest = results[0]!.close;
+    const prev = results[1]?.close ?? latest;
+    return { vixLevel: latest, vixDelta: latest - prev };
+  } catch {
+    return {};
+  }
+}
+
+// For each symbol, compute Reddit mention velocity (last 1h vs prior 24h avg)
+// and the average sentiment across those posts. One D1 round-trip total.
+async function loadRedditContext(
+  db: D1Database,
+  symbols: string[],
+): Promise<Map<string, SignalContext>> {
+  const out = new Map<string, SignalContext>();
+  if (symbols.length === 0) return out;
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const placeholders = symbols.map(() => '?').join(',');
+    const stmt = db
+      .prepare(
+        `SELECT m.symbol AS symbol,
+                SUM(CASE WHEN p.created_utc >= ?1 THEN m.mention_count ELSE 0 END) AS recent,
+                SUM(CASE WHEN p.created_utc < ?1 THEN m.mention_count ELSE 0 END) AS prior,
+                AVG(CASE WHEN p.created_utc >= ?1 THEN m.sentiment ELSE NULL END) AS sentiment
+           FROM reddit_mentions m
+           JOIN reddit_posts p ON p.id = m.post_id
+          WHERE p.created_utc >= ?2
+            AND m.symbol IN (${placeholders})
+          GROUP BY m.symbol`,
+      )
+      .bind(now - 3600, now - 86400, ...symbols);
+    const { results } = await stmt.all<{
+      symbol: string;
+      recent: number;
+      prior: number;
+      sentiment: number | null;
+    }>();
+    for (const r of results) {
+      // Velocity = recent-1h rate / 23h-prior hourly rate. 1 ≈ steady, >1 spiking.
+      const priorRate = (r.prior ?? 0) / 23;
+      const recentRate = r.recent ?? 0;
+      const velocity = priorRate > 0 ? recentRate / priorRate : recentRate > 0 ? 5 : 1;
+      out.set(r.symbol, {
+        redditVelocity: velocity,
+        redditSentiment: r.sentiment ?? 0,
+      });
+    }
+  } catch {
+    // Reddit tables may not exist on older DBs; soft-fail.
+  }
+  return out;
+}
+
+// Compute P/C ratio and gamma concentration from the latest options snapshot
+// per underlying. Spot price comes from the latest 1-min bar close.
+async function loadOptionsContext(
+  db: D1Database,
+  symbols: string[],
+): Promise<Map<string, SignalContext>> {
+  const out = new Map<string, SignalContext>();
+  if (symbols.length === 0) return out;
+  try {
+    const placeholders = symbols.map(() => '?').join(',');
+    const { results } = await db
+      .prepare(
+        `WITH latest AS (
+           SELECT underlying, MAX(fetched_at) AS fetched_at
+             FROM options_snapshots
+            WHERE underlying IN (${placeholders})
+            GROUP BY underlying
+         ),
+         spot AS (
+           SELECT b.symbol AS underlying, b.close
+             FROM bars b
+             JOIN (
+               SELECT symbol, MAX(ts) AS ts
+                 FROM bars
+                WHERE interval = '1min'
+                  AND symbol IN (${placeholders})
+                GROUP BY symbol
+             ) m ON m.symbol = b.symbol AND m.ts = b.ts
+            WHERE b.interval = '1min'
+         )
+         SELECT s.underlying AS symbol,
+                SUM(CASE WHEN s.type='put' THEN s.volume ELSE 0 END) AS put_vol,
+                SUM(CASE WHEN s.type='call' THEN s.volume ELSE 0 END) AS call_vol,
+                SUM(s.open_interest) AS total_oi,
+                SUM(CASE WHEN ABS(s.strike - sp.close) / sp.close <= 0.02
+                         THEN s.open_interest ELSE 0 END) AS near_oi
+           FROM options_snapshots s
+           JOIN latest l ON l.underlying = s.underlying AND l.fetched_at = s.fetched_at
+           JOIN spot sp ON sp.underlying = s.underlying
+          GROUP BY s.underlying`,
+      )
+      .bind(...symbols, ...symbols)
+      .all<{
+        symbol: string;
+        put_vol: number | null;
+        call_vol: number | null;
+        total_oi: number | null;
+        near_oi: number | null;
+      }>();
+    for (const r of results) {
+      const pv = r.put_vol ?? 0;
+      const cv = r.call_vol ?? 0;
+      const tot = r.total_oi ?? 0;
+      const near = r.near_oi ?? 0;
+      out.set(r.symbol, {
+        pcRatio: cv > 0 ? pv / cv : 1,
+        gammaConcentration: tot > 0 ? near / tot : 0,
+      });
+    }
+  } catch {
+    // Options snapshots are optional (POLL_OPTIONS=false by default); soft-fail.
+  }
+  return out;
 }
 
 async function runBackfill(env: Env, days: number): Promise<{

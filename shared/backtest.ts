@@ -1,5 +1,5 @@
 import type { Bar } from './types';
-import { atr, bollinger, etDayKey, isNum, rsi, volRegime, vwap } from './indicators';
+import { aggregateTo, atr, bollinger, ema, etDayKey, isNum, rsi, volRegime, vwap } from './indicators';
 import type { DetectedSignal, SetupName } from './setups';
 import { buildFeatures, type FeatureName } from './features';
 
@@ -86,6 +86,12 @@ export function backtest(
   const atrSeries = atr(bars, 14);
   const dayKeys = bars.map((b) => etDayKey(b.ts));
 
+  // Precompute multi-timeframe EMA(9) on 5m and 15m aggregates so trades can
+  // look them up by bar index in O(1). aggregate->EMA is O(N) once per
+  // backtest instead of per-trade.
+  const mtf5 = buildMtfLookup(bars, 5 * 60, 9);
+  const mtf15 = buildMtfLookup(bars, 15 * 60, 9);
+
   const days: DayInfo[] = [];
   let lastDay = '';
   for (let i = 0; i < bars.length; i++) {
@@ -155,6 +161,8 @@ export function backtest(
     const bbBand = bbSeries[entryIndex];
     const lastAtr = atrSeries[entryIndex] ?? 0;
     const regime = volRegime(bars, atrSeries, entryIndex, VOL_REGIME_LOOKBACK);
+    const ema5 = mtf5[entryIndex];
+    const ema15 = mtf15[entryIndex];
     const features = buildFeatures({
       close: entryBar.close,
       prevClose: day.prevClose,
@@ -165,6 +173,12 @@ export function backtest(
       atr: isNum(lastAtr) ? lastAtr : 0,
       ts: entryBar.ts,
       volRegime: regime,
+      // VIX/Reddit/Options context is not historically available in backtest;
+      // those features fall back to neutral defaults in buildFeatures.
+      context: {
+        ema5mDist: isNum(ema5) && entryBar.close > 0 ? (entryBar.close - ema5) / entryBar.close : 0,
+        ema15mDist: isNum(ema15) && entryBar.close > 0 ? (entryBar.close - ema15) / entryBar.close : 0,
+      },
     });
     trades.push({
       symbol,
@@ -323,6 +337,24 @@ function aggregate(trades: BacktestTrade[]): SetupStats[] {
 export function combineResults(results: BacktestResult[]): SetupStats[] {
   const allTrades = results.flatMap((r) => r.trades);
   return aggregate(allTrades);
+}
+
+// For each 1-min bar index, returns the EMA(period) value of the higher
+// timeframe (bucketSec) bucket containing that minute. NaN until the
+// higher-timeframe EMA has enough warmup. Lets backtest look up MTF
+// context in O(1) per trade rather than re-aggregating each entry.
+function buildMtfLookup(bars: Bar[], bucketSec: number, period: number): number[] {
+  const out = new Array<number>(bars.length).fill(NaN);
+  if (bars.length === 0) return out;
+  const agg = aggregateTo(bars, bucketSec);
+  const aggEma = ema(agg.map((b) => b.close), period);
+  let aggIdx = 0;
+  for (let i = 0; i < bars.length; i++) {
+    const ts = bars[i]!.ts;
+    while (aggIdx + 1 < agg.length && agg[aggIdx + 1]!.ts <= ts) aggIdx++;
+    out[i] = aggEma[aggIdx] ?? NaN;
+  }
+  return out;
 }
 
 export type { DetectedSignal };

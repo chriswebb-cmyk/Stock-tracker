@@ -152,6 +152,41 @@ export function etDayKey(tsSeconds: number): string {
   return `${y}-${m}-${day}`;
 }
 
+// Roll 1-min bars into a higher timeframe by floor-bucketing on bucketSec.
+// Returns OHLCV bars ascending in time. Used by multi-timeframe features
+// so we can compute, e.g., the 5m EMA(9) on top of stored 1m data without
+// fetching separate higher-timeframe series.
+export function aggregateTo(bars: Bar[], bucketSec: number): Bar[] {
+  if (bars.length === 0 || bucketSec <= 60) return bars.slice();
+  const out: Bar[] = [];
+  let bucketTs = -1;
+  let cur: Bar | null = null;
+  for (const b of bars) {
+    const ts = Math.floor(b.ts / bucketSec) * bucketSec;
+    if (cur === null || ts !== bucketTs) {
+      if (cur !== null) out.push(cur);
+      bucketTs = ts;
+      cur = {
+        symbol: b.symbol,
+        interval: b.interval,
+        ts: bucketTs,
+        open: b.open,
+        high: b.high,
+        low: b.low,
+        close: b.close,
+        volume: b.volume,
+      };
+    } else {
+      cur.high = Math.max(cur.high, b.high);
+      cur.low = Math.min(cur.low, b.low);
+      cur.close = b.close;
+      cur.volume += b.volume;
+    }
+  }
+  if (cur !== null) out.push(cur);
+  return out;
+}
+
 // Volatility regime: percentile rank of the most recent ATR/price ratio
 // against the same ratio over the trailing window. Returns 0..1 where 1 =
 // most volatile minute in the window, 0 = calmest. Used as an ML feature so

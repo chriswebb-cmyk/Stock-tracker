@@ -17,6 +17,11 @@ export interface Model {
   bias: number;
   trainedAt: number;
   stats: ModelStats;
+  // Platt-scaling parameters applied to raw logit at inference time:
+  // calibratedProb = sigmoid(calibA * z + calibB). When absent, predict
+  // falls back to sigmoid(z) directly (old models stay backwards-compatible).
+  calibA?: number;
+  calibB?: number;
 }
 
 export function sigmoid(z: number): number {
@@ -35,6 +40,11 @@ export function predict(model: Model, rawFeatures: number[]): number {
     const std = model.stds[i] || 1;
     const norm = (v - (model.means[i] ?? 0)) / std;
     z += (model.weights[i] ?? 0) * norm;
+  }
+  // If Platt parameters are stored, apply calibrated transform; otherwise
+  // fall back to the raw sigmoid for backwards compatibility.
+  if (model.calibA !== undefined && model.calibB !== undefined) {
+    return sigmoid(model.calibA * z + model.calibB);
   }
   return sigmoid(z);
 }
@@ -59,6 +69,8 @@ export function trainLogReg(
   means: number[];
   stds: number[];
   stats: ModelStats;
+  calibA: number;
+  calibB: number;
 } {
   const iterations = opts.iterations ?? 400;
   const lr = opts.learningRate ?? 0.1;
@@ -72,6 +84,8 @@ export function trainLogReg(
       bias: 0,
       means: [],
       stds: [],
+      calibA: 1,
+      calibB: 0,
       stats: { trainAccuracy: 0, valAccuracy: 0, trainBaseline: 0, sampleCount: 0 },
     };
   }
@@ -153,11 +167,26 @@ export function trainLogReg(
   const trainPositives = y_train.filter((v) => v === 1).length;
   const baseline = Math.max(trainPositives, trainSize - trainPositives) / trainSize;
 
+  // Platt calibration: fit a 1-D logistic on (val_logit, val_label) so
+  // reported probabilities match observed win rates. Without this a "60%"
+  // prediction often actually wins ~45% of the time because logreg's
+  // sigmoid output isn't naturally calibrated under class imbalance + L2.
+  const valLogits: number[] = [];
+  for (let i = 0; i < valSize; i++) {
+    let z = bias;
+    const row = X_val_n[i]!;
+    for (let j = 0; j < n; j++) z += (weights[j] ?? 0) * row[j]!;
+    valLogits.push(z);
+  }
+  const { a: calibA, b: calibB } = fitPlatt(valLogits, y_val);
+
   return {
     weights,
     bias,
     means,
     stds,
+    calibA,
+    calibB,
     stats: {
       trainAccuracy: trainSize > 0 ? trainCorrect / trainSize : 0,
       valAccuracy: valSize > 0 ? valCorrect / valSize : 0,
@@ -165,6 +194,34 @@ export function trainLogReg(
       sampleCount: m,
     },
   };
+}
+
+// 1-D logistic regression to map raw logits -> calibrated probabilities.
+// Returns (a, b) such that calibratedProb(z) = sigmoid(a * z + b). Falls
+// back to (1, 0) (identity) when the validation set is too small or all
+// labels are identical.
+function fitPlatt(zs: number[], ys: number[]): { a: number; b: number } {
+  if (zs.length < 10) return { a: 1, b: 0 };
+  const posCount = ys.reduce((c, y) => c + (y === 1 ? 1 : 0), 0);
+  if (posCount === 0 || posCount === ys.length) return { a: 1, b: 0 };
+  let a = 1;
+  let b = 0;
+  const lr = 0.05;
+  const iters = 200;
+  const m = zs.length;
+  for (let it = 0; it < iters; it++) {
+    let gradA = 0;
+    let gradB = 0;
+    for (let i = 0; i < m; i++) {
+      const p = sigmoid(a * zs[i]! + b);
+      const err = p - ys[i]!;
+      gradA += err * zs[i]!;
+      gradB += err;
+    }
+    a -= lr * (gradA / m);
+    b -= lr * (gradB / m);
+  }
+  return { a, b };
 }
 
 // Mulberry32 PRNG via seed for reproducible shuffles.
@@ -194,6 +251,8 @@ export function modelToJson(m: Model): string {
     stds: m.stds,
     weights: m.weights,
     bias: m.bias,
+    calibA: m.calibA,
+    calibB: m.calibB,
   });
 }
 
@@ -205,6 +264,8 @@ export function modelFromJson(setup: SetupName, json: string, trainedAt: number,
       stds?: number[];
       weights?: number[];
       bias?: number;
+      calibA?: number;
+      calibB?: number;
     };
     if (!obj.weights || !obj.means || !obj.stds || obj.bias === undefined) return null;
     return {
@@ -216,6 +277,8 @@ export function modelFromJson(setup: SetupName, json: string, trainedAt: number,
       bias: obj.bias,
       trainedAt,
       stats,
+      calibA: obj.calibA,
+      calibB: obj.calibB,
     };
   } catch {
     return null;

@@ -1,5 +1,6 @@
 import type { Bar } from './types';
-import { atr, bollinger, etDayKey, isNum, rsi, volRegime, vwap, type BollingerBand } from './indicators';
+import { aggregateTo, atr, bollinger, ema, etDayKey, isNum, rsi, volRegime, vwap, type BollingerBand } from './indicators';
+import { buildFeatures, type SignalContext } from './features';
 
 export type SetupName =
   | 'vwap_reclaim_long'
@@ -31,7 +32,12 @@ const RSI_OVERSOLD = 30;
 const RSI_OVERBOUGHT = 70;
 const VOL_REGIME_LOOKBACK = 390;
 
-export function detectSetups(symbol: string, bars: Bar[], prevClose: number): DetectedSignal[] {
+export function detectSetups(
+  symbol: string,
+  bars: Bar[],
+  prevClose: number,
+  context: SignalContext = {},
+): DetectedSignal[] {
   const out: DetectedSignal[] = [];
   if (bars.length < 30) return out;
 
@@ -58,11 +64,33 @@ export function detectSetups(symbol: string, bars: Bar[], prevClose: number): De
   const changePct = prevClose > 0 ? (last.close - prevClose) / prevClose : 0;
 
   const regime = volRegime(bars, atrSeries, i, VOL_REGIME_LOOKBACK);
+  // Multi-timeframe EMA distances. Compute the 5m/15m aggregates from the
+  // 1-min bars we already have so we don't need separate higher-timeframe
+  // data fetches.
+  const ema5mDist = computeEmaDist(bars, 5 * 60, 9, last.close);
+  const ema15mDist = computeEmaDist(bars, 15 * 60, 9, last.close);
+  const mergedContext: SignalContext = { ...context, ema5mDist, ema15mDist };
+  // Build the ML-ready feature vector once. setups.ts is responsible for
+  // putting FEATURE_NAMES-keyed values into sig.features so that live
+  // inference (featuresToVector(sig.features)) finds them by name.
+  const mlFeatures = buildFeatures({
+    close: last.close,
+    prevClose,
+    rsi: isNum(lastRsi) ? lastRsi : 50,
+    vwap: isNum(lastVwap) ? lastVwap : last.close,
+    bbLower: lastBb && isNum(lastBb.lower) ? lastBb.lower : last.close,
+    bbUpper: lastBb && isNum(lastBb.upper) ? lastBb.upper : last.close,
+    atr: isNum(lastAtr) ? lastAtr : 0,
+    ts: last.ts,
+    volRegime: regime,
+    context: mergedContext,
+  });
   const baseFeatures: Record<string, number> = {
+    // Raw values for human inspection / Discord alerts.
     close: last.close,
     prev_close: prevClose,
-    change_pct: changePct,
-    vol_regime: regime,
+    // ML-keyed normalized features.
+    ...mlFeatures,
   };
   if (isNum(lastVwap)) baseFeatures.vwap = lastVwap;
   if (isNum(lastRsi)) baseFeatures.rsi = lastRsi;
@@ -224,4 +252,22 @@ export function detectSetups(symbol: string, bars: Bar[], prevClose: number): De
   }
 
   return out;
+}
+
+// Aggregates the 1-min bars to `bucketSec` resolution, computes EMA(`period`)
+// on the resulting closes, and returns the signed fractional distance of
+// `currentClose` from the latest EMA value. Returns 0 if there's not enough
+// data — that's neutral after clamping in buildFeatures.
+function computeEmaDist(
+  bars: Bar[],
+  bucketSec: number,
+  period: number,
+  currentClose: number,
+): number {
+  const agg = aggregateTo(bars, bucketSec);
+  if (agg.length < period) return 0;
+  const emaSeries = ema(agg.map((b) => b.close), period);
+  const last = emaSeries[emaSeries.length - 1];
+  if (!isNum(last) || currentClose <= 0) return 0;
+  return (currentClose - last) / currentClose;
 }
