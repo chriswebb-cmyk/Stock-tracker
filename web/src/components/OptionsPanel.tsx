@@ -6,23 +6,23 @@ interface Props {
   tickers: Ticker[];
 }
 
-function fmtMoney(v: number | null): string {
-  if (v === null) return '—';
+function fmtMoney(v: number | null | undefined): string {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return '—';
   return v.toFixed(2);
 }
 
-function fmtInt(v: number | null): string {
-  if (v === null) return '—';
+function fmtInt(v: number | null | undefined): string {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return '—';
   return v.toLocaleString();
 }
 
-function fmtPct(v: number | null): string {
-  if (v === null) return '—';
+function fmtPct(v: number | null | undefined): string {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return '—';
   return (v * 100).toFixed(1) + '%';
 }
 
-function fmtGreek(v: number | null, digits = 2): string {
-  if (v === null) return '—';
+function fmtGreek(v: number | null | undefined, digits = 2): string {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return '—';
   return v.toFixed(digits);
 }
 
@@ -207,8 +207,9 @@ export function OptionsPanel({ tickers }: Props) {
 }
 
 function PriceBanner({ chain }: { chain: OptionsChain }) {
-  const change = chain.dayChange;
-  const changePct = chain.dayChangePct;
+  const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+  const change = isNum(chain.dayChange) ? chain.dayChange : null;
+  const changePct = isNum(chain.dayChangePct) ? chain.dayChangePct : null;
   const positive = change !== null && change >= 0;
   const changeColor =
     change === null ? 'text-slate-400' : positive ? 'text-emerald-400' : 'text-rose-400';
@@ -230,10 +231,10 @@ function PriceBanner({ chain }: { chain: OptionsChain }) {
         </div>
       )}
       <div className="text-xs text-slate-400">
-        High <span className="text-slate-100 tabular-nums">{chain.dayHigh !== null ? '$' + chain.dayHigh.toFixed(2) : '—'}</span>
+        High <span className="text-slate-100 tabular-nums">{isNum(chain.dayHigh) ? '$' + chain.dayHigh.toFixed(2) : '—'}</span>
         {' · '}
-        Low <span className="text-slate-100 tabular-nums">{chain.dayLow !== null ? '$' + chain.dayLow.toFixed(2) : '—'}</span>
-        {chain.prevClose !== null && (
+        Low <span className="text-slate-100 tabular-nums">{isNum(chain.dayLow) ? '$' + chain.dayLow.toFixed(2) : '—'}</span>
+        {isNum(chain.prevClose) && (
           <>
             {' · '}
             Prev close <span className="text-slate-100 tabular-nums">${chain.prevClose.toFixed(2)}</span>
