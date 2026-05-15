@@ -1069,16 +1069,34 @@ async function getOptionsChain(
     // Fall through to live fetch.
   }
 
-  const url = `https://query1.finance.yahoo.com/v7/finance/options/${encodeURIComponent(symbol)}${expirationTs ? `?date=${expirationTs}` : ''}`;
-  const res = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; stock-tracker/0.1)',
-      Accept: 'application/json',
-    },
-    signal: AbortSignal.timeout(8_000),
-  });
-  if (!res.ok) {
-    throw new HttpError(res.status, `Yahoo options ${res.status} for ${symbol}`);
+  // Yahoo's options endpoint is fussier about clients than its chart
+  // endpoint and has been returning 401 for generic User-Agents. Rotate
+  // between the two hosts and send realistic browser headers.
+  const hosts = ['https://query2.finance.yahoo.com', 'https://query1.finance.yahoo.com'];
+  const dateParam = expirationTs ? `&date=${expirationTs}` : '';
+  const yahooPath = `/v7/finance/options/${encodeURIComponent(symbol)}?lang=en-US&region=US${dateParam}`;
+  const browserHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    Accept: 'application/json,text/plain,*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    Referer: 'https://finance.yahoo.com/',
+    Origin: 'https://finance.yahoo.com',
+  };
+  let res: Response | null = null;
+  let lastStatus = 0;
+  for (const host of hosts) {
+    const r = await fetch(`${host}${yahooPath}`, { headers: browserHeaders, signal: AbortSignal.timeout(8_000) });
+    if (r.ok) {
+      res = r;
+      break;
+    }
+    lastStatus = r.status;
+  }
+  if (!res) {
+    throw new HttpError(
+      lastStatus || 502,
+      `Yahoo options ${lastStatus} for ${symbol} — they're blocking unauthenticated options requests. Switch to Tradier (free signup) if this persists.`,
+    );
   }
   const json = (await res.json()) as YahooOptionsResponse;
   const result = json.optionChain?.result?.[0];
