@@ -167,13 +167,21 @@ async function route(url: URL, request: Request, env: Env): Promise<unknown> {
     return getRedditPosts(env.DB, symbol, limit, subreddit);
   }
 
-  // Company news for a symbol via Finnhub. Cached in json_cache for 30
-  // minutes so we don't burn through the free tier on every chart load.
+  // Company news for a symbol via Finnhub.
   const newsMatch = path.match(/^\/news\/([A-Za-z.^\-]+)$/);
   if (newsMatch && request.method === 'GET') {
     const symbol = newsMatch[1]!.toUpperCase();
     const limit = clampInt(url.searchParams.get('limit'), 1, 50, 20);
     return getCompanyNews(env, symbol, limit);
+  }
+
+  // Options chain for a symbol — nearest expiration by default. Yahoo's
+  // free options endpoint with Black-Scholes greeks computed in-worker.
+  const optionsMatch2 = path.match(/^\/options-chain\/([A-Za-z.\-]+)$/);
+  if (optionsMatch2 && request.method === 'GET') {
+    const symbol = optionsMatch2[1]!.toUpperCase();
+    const expiration = url.searchParams.get('expiration');
+    return getOptionsChain(env, symbol, expiration ? Number(expiration) : null);
   }
 
   // Triggers an on-demand scrape on the reddit worker via the service
@@ -1005,4 +1013,220 @@ async function getRedditPosts(
     createdUtc: r.created_utc,
     fetchedAt: r.fetched_at,
   }));
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// Options chain (Yahoo free endpoint + Black-Scholes greeks)
+// ─────────────────────────────────────────────────────────────────────────
+
+interface OptionContract {
+  contractSymbol: string;
+  strike: number;
+  bid: number | null;
+  ask: number | null;
+  last: number | null;
+  volume: number | null;
+  openInterest: number | null;
+  impliedVolatility: number | null;
+  inTheMoney: boolean;
+  delta: number | null;
+  gamma: number | null;
+  theta: number | null;
+  vega: number | null;
+}
+
+interface OptionsChainResponse {
+  symbol: string;
+  spot: number;
+  expiration: number; // unix seconds
+  expirationDate: string; // YYYY-MM-DD
+  daysToExpiry: number;
+  availableExpirations: number[]; // all expirations Yahoo offers
+  calls: OptionContract[];
+  puts: OptionContract[];
+}
+
+// Fetch a symbol's options chain from Yahoo's free endpoint. Cached in
+// json_cache for 60s — chains barely move between page loads, and we'd
+// otherwise burn rate budget on every dashboard refresh.
+async function getOptionsChain(
+  env: Env,
+  symbol: string,
+  expirationTs: number | null,
+): Promise<OptionsChainResponse> {
+  const cacheKey = `options-${symbol}-${expirationTs ?? 'nearest'}`;
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    const row = await env.DB
+      .prepare('SELECT value, updated_at FROM json_cache WHERE key = ?')
+      .bind(cacheKey)
+      .first<{ value: string; updated_at: number }>();
+    if (row && now - row.updated_at < 60) {
+      return JSON.parse(row.value) as OptionsChainResponse;
+    }
+  } catch {
+    // Fall through to live fetch.
+  }
+
+  const url = `https://query1.finance.yahoo.com/v7/finance/options/${encodeURIComponent(symbol)}${expirationTs ? `?date=${expirationTs}` : ''}`;
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; stock-tracker/0.1)',
+      Accept: 'application/json',
+    },
+    signal: AbortSignal.timeout(8_000),
+  });
+  if (!res.ok) {
+    throw new HttpError(res.status, `Yahoo options ${res.status} for ${symbol}`);
+  }
+  const json = (await res.json()) as YahooOptionsResponse;
+  const result = json.optionChain?.result?.[0];
+  if (!result) throw new HttpError(502, `no chain returned for ${symbol}`);
+  const opt = result.options?.[0];
+  if (!opt) throw new HttpError(502, `no options block for ${symbol}`);
+
+  const spot = result.quote?.regularMarketPrice ?? 0;
+  const expiration = opt.expirationDate;
+  const expirationDate = new Date(expiration * 1000).toISOString().slice(0, 10);
+  const daysToExpiry = Math.max(0, (expiration - now) / 86400);
+
+  // Get current risk-free rate from latest ^TNX close. ^TNX is reported
+  // as a percentage (e.g. 4.35 = 4.35%), so divide by 100.
+  let rate = 0.045; // sensible default if ^TNX unavailable
+  try {
+    const tnx = await env.DB
+      .prepare(`SELECT close FROM bars WHERE symbol='^TNX' AND interval='1min' ORDER BY ts DESC LIMIT 1`)
+      .first<{ close: number }>();
+    if (tnx && tnx.close > 0) rate = tnx.close / 100;
+  } catch {
+    // Stick with default rate.
+  }
+
+  const yearsToExpiry = daysToExpiry / 365;
+  const calls = (opt.calls ?? []).map((c) => toContract(c, spot, rate, yearsToExpiry, 'call'));
+  const puts = (opt.puts ?? []).map((c) => toContract(c, spot, rate, yearsToExpiry, 'put'));
+
+  const response: OptionsChainResponse = {
+    symbol,
+    spot,
+    expiration,
+    expirationDate,
+    daysToExpiry: Math.round(daysToExpiry * 10) / 10,
+    availableExpirations: result.expirationDates ?? [],
+    calls,
+    puts,
+  };
+
+  try {
+    await env.DB
+      .prepare(
+        `INSERT INTO json_cache(key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+      )
+      .bind(cacheKey, JSON.stringify(response), now)
+      .run();
+  } catch {
+    // Cache write is best-effort.
+  }
+  return response;
+}
+
+interface YahooOptionsResponse {
+  optionChain?: {
+    result?: Array<{
+      underlyingSymbol?: string;
+      expirationDates?: number[];
+      strikes?: number[];
+      quote?: { regularMarketPrice?: number };
+      options?: Array<{
+        expirationDate: number;
+        calls?: YahooContractRaw[];
+        puts?: YahooContractRaw[];
+      }>;
+    }>;
+  };
+}
+
+interface YahooContractRaw {
+  contractSymbol: string;
+  strike: number;
+  bid?: number;
+  ask?: number;
+  lastPrice?: number;
+  volume?: number;
+  openInterest?: number;
+  impliedVolatility?: number;
+  inTheMoney?: boolean;
+}
+
+function toContract(
+  c: YahooContractRaw,
+  spot: number,
+  rate: number,
+  t: number,
+  kind: 'call' | 'put',
+): OptionContract {
+  const iv = typeof c.impliedVolatility === 'number' && c.impliedVolatility > 0 ? c.impliedVolatility : null;
+  const greeks = iv && spot > 0 && c.strike > 0 && t > 0
+    ? blackScholesGreeks(spot, c.strike, rate, iv, t, kind)
+    : { delta: null, gamma: null, theta: null, vega: null };
+  return {
+    contractSymbol: c.contractSymbol,
+    strike: c.strike,
+    bid: c.bid ?? null,
+    ask: c.ask ?? null,
+    last: c.lastPrice ?? null,
+    volume: c.volume ?? null,
+    openInterest: c.openInterest ?? null,
+    impliedVolatility: iv,
+    inTheMoney: !!c.inTheMoney,
+    ...greeks,
+  };
+}
+
+// Black-Scholes greeks. Uses ^TNX as the risk-free rate; assumes zero
+// dividend yield (slight bias for high-divvy underlyings but close enough
+// for ATM-near strikes used for swing trades). N(x) approximation is
+// Abramowitz-Stegun 7.1.26 — accurate to ~7e-8 across the real line.
+function blackScholesGreeks(
+  s: number,
+  k: number,
+  r: number,
+  sigma: number,
+  t: number,
+  kind: 'call' | 'put',
+): { delta: number; gamma: number; theta: number; vega: number } {
+  const sqrtT = Math.sqrt(t);
+  const d1 = (Math.log(s / k) + (r + (sigma * sigma) / 2) * t) / (sigma * sqrtT);
+  const d2 = d1 - sigma * sqrtT;
+  const nd1 = normalCdf(d1);
+  const npd1 = normalPdf(d1);
+  const nd2 = normalCdf(d2);
+  let delta: number;
+  let theta: number;
+  if (kind === 'call') {
+    delta = nd1;
+    theta = (-(s * npd1 * sigma) / (2 * sqrtT) - r * k * Math.exp(-r * t) * nd2) / 365;
+  } else {
+    delta = nd1 - 1;
+    theta = (-(s * npd1 * sigma) / (2 * sqrtT) + r * k * Math.exp(-r * t) * normalCdf(-d2)) / 365;
+  }
+  const gamma = npd1 / (s * sigma * sqrtT);
+  const vega = (s * npd1 * sqrtT) / 100; // per 1% IV change
+  return { delta, gamma, theta, vega };
+}
+
+function normalCdf(x: number): number {
+  const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741;
+  const a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+  const sign = x < 0 ? -1 : 1;
+  const ax = Math.abs(x) / Math.SQRT2;
+  const t = 1 / (1 + p * ax);
+  const y = 1 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-ax * ax);
+  return 0.5 * (1 + sign * y);
+}
+
+function normalPdf(x: number): number {
+  return Math.exp(-(x * x) / 2) / Math.sqrt(2 * Math.PI);
 }

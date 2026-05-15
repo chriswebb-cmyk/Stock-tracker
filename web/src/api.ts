@@ -62,6 +62,33 @@ export interface NewsItem {
   image?: string;
 }
 
+export interface OptionContract {
+  contractSymbol: string;
+  strike: number;
+  bid: number | null;
+  ask: number | null;
+  last: number | null;
+  volume: number | null;
+  openInterest: number | null;
+  impliedVolatility: number | null;
+  inTheMoney: boolean;
+  delta: number | null;
+  gamma: number | null;
+  theta: number | null;
+  vega: number | null;
+}
+
+export interface OptionsChain {
+  symbol: string;
+  spot: number;
+  expiration: number; // unix seconds
+  expirationDate: string; // YYYY-MM-DD
+  daysToExpiry: number;
+  availableExpirations: number[];
+  calls: OptionContract[];
+  puts: OptionContract[];
+}
+
 export interface SignalRow {
   id: number;
   symbol: string;
@@ -94,6 +121,10 @@ export const api = {
   models: () => getJson<ModelsResponse>('/ml/models'),
   news: (symbol: string, limit = 20) =>
     getJson<NewsItem[]>(`/news/${encodeURIComponent(symbol)}?limit=${limit}`),
+  optionsChain: (symbol: string, expirationTs?: number) =>
+    getJson<OptionsChain>(
+      `/options-chain/${encodeURIComponent(symbol)}${expirationTs ? `?expiration=${expirationTs}` : ''}`,
+    ),
   signals: (limit = 50) => getJson<SignalRow[]>(`/signals?limit=${limit}`),
   signalsForSymbol: (symbol: string, days = 7) =>
     getJson<SignalRow[]>(`/signals/by-symbol/${encodeURIComponent(symbol)}?days=${days}`),
