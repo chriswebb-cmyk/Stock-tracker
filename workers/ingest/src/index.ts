@@ -27,10 +27,10 @@ export interface Env {
   SIGNAL_COOLDOWN_SECONDS?: string;
   ML_DISCORD_THRESHOLD?: string;
   DISABLED_SETUPS?: string;
-  // Number of cron buckets to split the watchlist across. With CHUNKS=2 each
-  // symbol is polled every 2 minutes; default keeps free-tier subrequests
-  // within budget for ~50 symbols.
   CHUNKS?: string;
+  // Which (setup, hold_minutes) models the live scorer consults. The
+  // trainer produces models at 15/30/60/120; this picks one. Default 30.
+  TARGET_HOLD_MINUTES?: string;
 }
 
 function isMarketHoursEt(d: Date): boolean {
@@ -143,7 +143,8 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
   try {
 
   // Load models + cooldown map up-front so we don't hit D1 inside the inner loop.
-  const modelRows = await loadModels(env.DB);
+  const targetHold = Math.max(1, Math.min(240, Number(env.TARGET_HOLD_MINUTES ?? '30')));
+  const modelRows = await loadModels(env.DB, targetHold);
   const models = new Map<SetupName, Model>();
   for (const [setup, row] of modelRows) {
     const m = modelFromJson(setup as SetupName, row.weightsJson, row.trainedAt, {
@@ -158,7 +159,7 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
   // of the per-setup probabilities to compute the final Discord-gating
   // probability. Falls back to the per-setup probability when meta isn't
   // trained yet.
-  const metaRow = await loadMetaModelRow(env.DB);
+  const metaRow = await loadMetaModelRow(env.DB, targetHold);
   const metaModel = metaRow
     ? modelFromJson('__meta__' as SetupName, metaRow.weightsJson, metaRow.trainedAt, {
         sampleCount: metaRow.sampleCount,

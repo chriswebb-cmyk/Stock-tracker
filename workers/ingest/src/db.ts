@@ -96,7 +96,7 @@ export async function loadRecentBars(
     .reverse();
 }
 
-export async function loadModels(db: D1Database): Promise<Map<string, {
+export async function loadModels(db: D1Database, holdMinutes: number): Promise<Map<string, {
   setup: string;
   weightsJson: string;
   trainedAt: number;
@@ -117,8 +117,10 @@ export async function loadModels(db: D1Database): Promise<Map<string, {
   const { results } = await db
     .prepare(
       `SELECT setup, weights_json, trained_at, sample_count,
-              train_accuracy, val_accuracy, train_baseline FROM models`,
+              train_accuracy, val_accuracy, train_baseline
+         FROM models WHERE hold_minutes = ?`,
     )
+    .bind(holdMinutes)
     .all<{
       setup: string;
       weights_json: string;
@@ -142,7 +144,7 @@ export async function loadModels(db: D1Database): Promise<Map<string, {
   return out;
 }
 
-export async function loadMetaModelRow(db: D1Database): Promise<{
+export async function loadMetaModelRow(db: D1Database, holdMinutes: number): Promise<{
   weightsJson: string;
   trainedAt: number;
   sampleCount: number;
@@ -154,8 +156,9 @@ export async function loadMetaModelRow(db: D1Database): Promise<{
     .prepare(
       `SELECT weights_json, trained_at, sample_count,
               train_accuracy, val_accuracy, train_baseline
-         FROM meta_model WHERE id = 1`,
+         FROM meta_model WHERE hold_minutes = ?`,
     )
+    .bind(holdMinutes)
     .first<{
       weights_json: string;
       trained_at: number;

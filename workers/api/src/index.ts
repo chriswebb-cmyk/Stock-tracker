@@ -480,14 +480,27 @@ async function getBacktestSummary(
   };
 }
 
+// Hold periods (minutes) the trainer produces models for. Each horizon
+// gets its own per-setup models and meta-ensemble — outcomes at 15m vs
+// 60m can differ wildly, so single-horizon training was leaving signal
+// on the table. The first entry is used as the "primary" hold reported
+// in the legacy response shape.
+const TRAIN_HOLDS_MINUTES = [15, 30, 60, 120] as const;
+
 async function trainModels(
   db: D1Database,
   days: number,
-  holdMinutes: number,
+  primaryHoldMinutes: number,
   cooldownSec: number,
 ): Promise<{
   perSetup: Array<{ setup: SetupName; samples: number; trainAcc: number; valAcc: number; baseline: number }>;
   meta: { samples: number; trainAcc: number; valAcc: number; baseline: number } | null;
+  byHold: Array<{
+    holdMinutes: number;
+    perSetup: Array<{ setup: SetupName; samples: number; trainAcc: number; valAcc: number; baseline: number }>;
+    meta: { samples: number; trainAcc: number; valAcc: number; baseline: number } | null;
+    trades: number;
+  }>;
   symbols: number;
   trades: number;
 }> {
@@ -502,153 +515,187 @@ async function trainModels(
     })),
   );
 
-  // Single backtest pass: collect every trade plus its base-feature vector
-  // and outcome. We use this twice — first to train the per-setup models,
-  // then to score those same trades for the meta-model training set.
-  interface TradeRow {
-    setup: SetupName;
-    direction: 'long' | 'short';
-    features: number[];
-    won: number; // 0/1
-  }
-  const allTrades: TradeRow[] = [];
-  let symbolsUsed = 0;
-  for (const { symbol, bars } of symbolBars) {
-    if (bars.length < 30) continue;
-    symbolsUsed += 1;
-    const result = backtest(symbol, bars, holdMinutes, cooldownSec);
-    for (const t of result.trades) {
-      allTrades.push({
-        setup: t.setup,
-        direction: t.direction,
-        features: featuresToVector(t.features),
-        won: t.pnlPct > 0 ? 1 : 0,
+  // Holds we train at — union of the requested primary hold and the
+  // standard set, deduped.
+  const holds = Array.from(new Set([primaryHoldMinutes, ...TRAIN_HOLDS_MINUTES])).sort((a, b) => a - b);
+  const trainedAt = Math.floor(Date.now() / 1000);
+
+  const byHold: Array<{
+    holdMinutes: number;
+    perSetup: Array<{ setup: SetupName; samples: number; trainAcc: number; valAcc: number; baseline: number }>;
+    meta: { samples: number; trainAcc: number; valAcc: number; baseline: number } | null;
+    trades: number;
+  }> = [];
+
+  let symbolsUsedMax = 0;
+  let primaryPerSetup: Array<{ setup: SetupName; samples: number; trainAcc: number; valAcc: number; baseline: number }> = [];
+  let primaryMeta: { samples: number; trainAcc: number; valAcc: number; baseline: number } | null = null;
+  let primaryTrades = 0;
+
+  for (const hold of holds) {
+    interface TradeRow {
+      setup: SetupName;
+      direction: 'long' | 'short';
+      features: number[];
+      won: number;
+    }
+    const allTrades: TradeRow[] = [];
+    let symbolsUsed = 0;
+    for (const { bars } of symbolBars) {
+      if (bars.length < 30) continue;
+      symbolsUsed += 1;
+      const result = backtest('-', bars, hold, cooldownSec);
+      for (const t of result.trades) {
+        allTrades.push({
+          setup: t.setup,
+          direction: t.direction,
+          features: featuresToVector(t.features),
+          won: t.pnlPct > 0 ? 1 : 0,
+        });
+      }
+    }
+    symbolsUsedMax = Math.max(symbolsUsedMax, symbolsUsed);
+
+    const bySetup = new Map<SetupName, { X: number[][]; y: number[] }>();
+    for (const t of allTrades) {
+      const bucket = bySetup.get(t.setup) ?? { X: [], y: [] };
+      bucket.X.push(t.features);
+      bucket.y.push(t.won);
+      bySetup.set(t.setup, bucket);
+    }
+
+    const perSetup: typeof primaryPerSetup = [];
+    const trainedPerSetupModels = new Map<SetupName, Model>();
+
+    for (const [setup, { X, y }] of bySetup) {
+      if (X.length < 30) continue;
+      const trained = trainLogReg(X, y);
+      const stats: ModelStats = trained.stats;
+      const model: Model = {
+        setup,
+        featureNames: FEATURE_NAMES,
+        means: trained.means,
+        stds: trained.stds,
+        weights: trained.weights,
+        bias: trained.bias,
+        trainedAt,
+        stats,
+        calibA: trained.calibA,
+        calibB: trained.calibB,
+      };
+      trainedPerSetupModels.set(setup, model);
+      const json = modelToJson(model);
+      await db
+        .prepare(
+          `INSERT INTO models(setup, hold_minutes, trained_at, sample_count,
+                              train_accuracy, val_accuracy, train_baseline,
+                              weights_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(setup, hold_minutes) DO UPDATE SET
+             trained_at = excluded.trained_at,
+             sample_count = excluded.sample_count,
+             train_accuracy = excluded.train_accuracy,
+             val_accuracy = excluded.val_accuracy,
+             train_baseline = excluded.train_baseline,
+             weights_json = excluded.weights_json`,
+        )
+        .bind(setup, hold, trainedAt, stats.sampleCount, stats.trainAccuracy, stats.valAccuracy, stats.trainBaseline, json)
+        .run();
+      perSetup.push({
+        setup,
+        samples: stats.sampleCount,
+        trainAcc: stats.trainAccuracy,
+        valAcc: stats.valAccuracy,
+        baseline: stats.trainBaseline,
       });
+    }
+
+    // Meta ensemble for this horizon.
+    const metaX: number[][] = [];
+    const metaY: number[] = [];
+    for (const t of allTrades) {
+      const model = trainedPerSetupModels.get(t.setup);
+      if (!model) continue;
+      const setupProb = predict(model, t.features);
+      metaX.push(buildMetaVector(setupProb, t.setup, t.direction, t.features));
+      metaY.push(t.won);
+    }
+    let meta: { samples: number; trainAcc: number; valAcc: number; baseline: number } | null = null;
+    if (metaX.length >= 50) {
+      const trained = trainLogReg(metaX, metaY);
+      const stats = trained.stats;
+      const json = modelToJson({
+        setup: '__meta__' as SetupName,
+        featureNames: FEATURE_NAMES,
+        means: trained.means,
+        stds: trained.stds,
+        weights: trained.weights,
+        bias: trained.bias,
+        trainedAt,
+        stats,
+        calibA: trained.calibA,
+        calibB: trained.calibB,
+      });
+      await db
+        .prepare(
+          `INSERT INTO meta_model(hold_minutes, trained_at, sample_count,
+                                  train_accuracy, val_accuracy, train_baseline,
+                                  weights_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(hold_minutes) DO UPDATE SET
+             trained_at = excluded.trained_at,
+             sample_count = excluded.sample_count,
+             train_accuracy = excluded.train_accuracy,
+             val_accuracy = excluded.val_accuracy,
+             train_baseline = excluded.train_baseline,
+             weights_json = excluded.weights_json`,
+        )
+        .bind(hold, trainedAt, stats.sampleCount, stats.trainAccuracy, stats.valAccuracy, stats.trainBaseline, json)
+        .run();
+      meta = {
+        samples: stats.sampleCount,
+        trainAcc: stats.trainAccuracy,
+        valAcc: stats.valAccuracy,
+        baseline: stats.trainBaseline,
+      };
+    }
+
+    perSetup.sort((a, b) => a.setup.localeCompare(b.setup));
+    byHold.push({ holdMinutes: hold, perSetup, meta, trades: allTrades.length });
+    if (hold === primaryHoldMinutes) {
+      primaryPerSetup = perSetup;
+      primaryMeta = meta;
+      primaryTrades = allTrades.length;
     }
   }
 
-  const bySetup = new Map<SetupName, { X: number[][]; y: number[] }>();
-  for (const t of allTrades) {
-    const bucket = bySetup.get(t.setup) ?? { X: [], y: [] };
-    bucket.X.push(t.features);
-    bucket.y.push(t.won);
-    bySetup.set(t.setup, bucket);
-  }
-
-  const trainedAt = Math.floor(Date.now() / 1000);
-  const perSetup: Array<{ setup: SetupName; samples: number; trainAcc: number; valAcc: number; baseline: number }> = [];
-  const trainedPerSetupModels = new Map<SetupName, Model>();
-
-  for (const [setup, { X, y }] of bySetup) {
-    if (X.length < 30) continue;
-    const trained = trainLogReg(X, y);
-    const stats: ModelStats = trained.stats;
-    const model: Model = {
-      setup,
-      featureNames: FEATURE_NAMES,
-      means: trained.means,
-      stds: trained.stds,
-      weights: trained.weights,
-      bias: trained.bias,
-      trainedAt,
-      stats,
-      calibA: trained.calibA,
-      calibB: trained.calibB,
-    };
-    trainedPerSetupModels.set(setup, model);
-    const json = modelToJson(model);
-    await db
-      .prepare(
-        `INSERT INTO models(setup, trained_at, sample_count, train_accuracy,
-                            val_accuracy, train_baseline, weights_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(setup) DO UPDATE SET
-           trained_at = excluded.trained_at,
-           sample_count = excluded.sample_count,
-           train_accuracy = excluded.train_accuracy,
-           val_accuracy = excluded.val_accuracy,
-           train_baseline = excluded.train_baseline,
-           weights_json = excluded.weights_json`,
-      )
-      .bind(setup, trainedAt, stats.sampleCount, stats.trainAccuracy, stats.valAccuracy, stats.trainBaseline, json)
-      .run();
-    perSetup.push({
-      setup,
-      samples: stats.sampleCount,
-      trainAcc: stats.trainAccuracy,
-      valAcc: stats.valAccuracy,
-      baseline: stats.trainBaseline,
-    });
-  }
-
-  // Meta-ensemble: score every trade with its (just-trained) per-setup
-  // model, then train one logistic regression that takes that probability
-  // plus context (setup one-hot, direction, base features) and predicts
-  // outcome. Caveat: this isn't truly out-of-fold — the per-setup model
-  // has seen these trades — so the meta valAcc is a touch optimistic.
-  // For a personal tool that's an acceptable trade-off vs. building a
-  // proper k-fold harness.
-  const metaX: number[][] = [];
-  const metaY: number[] = [];
-  for (const t of allTrades) {
-    const model = trainedPerSetupModels.get(t.setup);
-    if (!model) continue;
-    const setupProb = predict(model, t.features);
-    metaX.push(buildMetaVector(setupProb, t.setup, t.direction, t.features));
-    metaY.push(t.won);
-  }
-
-  let meta: { samples: number; trainAcc: number; valAcc: number; baseline: number } | null = null;
-  if (metaX.length >= 50) {
-    const trained = trainLogReg(metaX, metaY);
-    const stats = trained.stats;
-    const json = modelToJson({
-      setup: '__meta__' as SetupName,
-      featureNames: FEATURE_NAMES,
-      means: trained.means,
-      stds: trained.stds,
-      weights: trained.weights,
-      bias: trained.bias,
-      trainedAt,
-      stats,
-      calibA: trained.calibA,
-      calibB: trained.calibB,
-    });
-    await db
-      .prepare(
-        `INSERT INTO meta_model(id, trained_at, sample_count, train_accuracy,
-                                val_accuracy, train_baseline, weights_json)
-         VALUES (1, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
-           trained_at = excluded.trained_at,
-           sample_count = excluded.sample_count,
-           train_accuracy = excluded.train_accuracy,
-           val_accuracy = excluded.val_accuracy,
-           train_baseline = excluded.train_baseline,
-           weights_json = excluded.weights_json`,
-      )
-      .bind(trainedAt, stats.sampleCount, stats.trainAccuracy, stats.valAccuracy, stats.trainBaseline, json)
-      .run();
-    meta = {
-      samples: stats.sampleCount,
-      trainAcc: stats.trainAccuracy,
-      valAcc: stats.valAccuracy,
-      baseline: stats.trainBaseline,
-    };
-  }
-
-  perSetup.sort((a, b) => a.setup.localeCompare(b.setup));
-  return { perSetup, meta, symbols: symbolsUsed, trades: allTrades.length };
+  return {
+    perSetup: primaryPerSetup,
+    meta: primaryMeta,
+    byHold,
+    symbols: symbolsUsedMax,
+    trades: primaryTrades,
+  };
 }
 
-async function getModels(db: D1Database): Promise<unknown[]> {
-  const { results } = await db
+async function getModels(db: D1Database): Promise<unknown> {
+  const perSetup = await db
     .prepare(
-      `SELECT setup, trained_at, sample_count, train_accuracy, val_accuracy,
-              train_baseline FROM models ORDER BY setup`,
+      `SELECT setup, hold_minutes, trained_at, sample_count, train_accuracy,
+              val_accuracy, train_baseline
+         FROM models
+        ORDER BY hold_minutes, setup`,
     )
     .all();
-  return results;
+  const meta = await db
+    .prepare(
+      `SELECT hold_minutes, trained_at, sample_count, train_accuracy,
+              val_accuracy, train_baseline
+         FROM meta_model
+        ORDER BY hold_minutes`,
+    )
+    .all();
+  return { perSetup: perSetup.results, meta: meta.results };
 }
 
 async function getSignalsForSymbol(db: D1Database, symbol: string, days: number): Promise<unknown[]> {

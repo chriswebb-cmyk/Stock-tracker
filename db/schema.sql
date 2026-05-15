@@ -100,30 +100,35 @@ CREATE TABLE IF NOT EXISTS json_cache (
 );
 
 -- Per-setup logistic regression model trained on backtest results. One row
--- per setup; retraining replaces the row.
+-- per (setup, hold_minutes); retraining replaces the row. Holding multiple
+-- horizons lets the system answer "what's the win probability at 15m vs
+-- 60m hold?" — useful for options trades where premium decay differs.
+DROP TABLE IF EXISTS models;
 CREATE TABLE IF NOT EXISTS models (
-  setup           TEXT PRIMARY KEY,
-  trained_at      INTEGER NOT NULL,
-  sample_count   INTEGER NOT NULL,
-  train_accuracy  REAL NOT NULL,
-  val_accuracy    REAL NOT NULL,
-  train_baseline  REAL NOT NULL,
-  weights_json    TEXT NOT NULL  -- {featureNames, means, stds, weights, bias}
-);
-
--- Meta (ensemble) model that stacks on top of the per-setup models. Single
--- row keyed by id=1. Takes per-setup probability + setup one-hot +
--- direction + base features as input and outputs a unified calibrated
--- probability. Trained whenever the per-setup retrain runs.
-CREATE TABLE IF NOT EXISTS meta_model (
-  id              INTEGER PRIMARY KEY DEFAULT 1,
+  setup           TEXT NOT NULL,
+  hold_minutes    INTEGER NOT NULL DEFAULT 30,
   trained_at      INTEGER NOT NULL,
   sample_count    INTEGER NOT NULL,
   train_accuracy  REAL NOT NULL,
   val_accuracy    REAL NOT NULL,
   train_baseline  REAL NOT NULL,
   weights_json    TEXT NOT NULL,
-  CHECK (id = 1)
+  PRIMARY KEY (setup, hold_minutes)
+);
+
+-- Meta (ensemble) model that stacks on top of the per-setup models. One
+-- row per hold_minutes horizon. Takes per-setup probability + setup
+-- one-hot + direction + base features as input and outputs a unified
+-- calibrated probability for that horizon.
+DROP TABLE IF EXISTS meta_model;
+CREATE TABLE IF NOT EXISTS meta_model (
+  hold_minutes    INTEGER PRIMARY KEY,
+  trained_at      INTEGER NOT NULL,
+  sample_count    INTEGER NOT NULL,
+  train_accuracy  REAL NOT NULL,
+  val_accuracy    REAL NOT NULL,
+  train_baseline  REAL NOT NULL,
+  weights_json    TEXT NOT NULL
 );
 
 -- Seed the default watchlist. ^VIX and ^TNX are included so the ingest
