@@ -1069,15 +1069,18 @@ async function getOptionsChain(
     // Fall through to live fetch.
   }
 
-  // Try Finnhub first (we already have the API key, it returns greeks
-  // pre-computed, single response includes all expirations). Fall back to
-  // Yahoo if Finnhub is paid-tier-gated for this account.
-  const finnhubResult = env.FINNHUB_API_KEY
+  // Try CBOE first — public CDN endpoint, no auth, ~15min delayed, ships
+  // greeks pre-computed. Falls back to Finnhub then Yahoo if CBOE doesn't
+  // list the symbol (rare; mostly exotic tickers).
+  const cboeResult = await tryCboeChain(symbol, expirationTs);
+  const finnhubResult = !cboeResult && env.FINNHUB_API_KEY
     ? await tryFinnhubChain(env.FINNHUB_API_KEY, symbol, expirationTs)
     : null;
 
   let response: OptionsChainResponse;
-  if (finnhubResult) {
+  if (cboeResult) {
+    response = cboeResult;
+  } else if (finnhubResult) {
     response = finnhubResult;
   } else {
     // Yahoo fallback. Their v7 endpoint is fussier than the chart endpoint;
@@ -1105,7 +1108,7 @@ async function getOptionsChain(
     if (!res) {
       throw new HttpError(
         lastStatus || 502,
-        `Both options sources failed for ${symbol}. Yahoo returned ${lastStatus}; Finnhub likely needs paid tier on your account.`,
+        `All options sources failed for ${symbol}. CBOE has no listing; Yahoo returned ${lastStatus}; Finnhub likely needs paid tier.`,
       );
     }
     const json = (await res.json()) as YahooOptionsResponse;
@@ -1212,6 +1215,160 @@ interface FinnhubContractRaw {
   theta?: number;
   vega?: number;
   inTheMoney?: string; // 'TRUE' / 'FALSE'
+}
+
+interface CboeOptionsResponse {
+  data?: {
+    symbol?: string;
+    current_price?: number;
+    bid?: number;
+    ask?: number;
+    options?: CboeContractRaw[];
+  };
+}
+
+interface CboeContractRaw {
+  option?: string; // OCC symbol, e.g. "AAPL250117C00100000"
+  bid?: number;
+  ask?: number;
+  iv?: number;
+  open_interest?: number;
+  volume?: number;
+  delta?: number;
+  gamma?: number;
+  theta?: number;
+  vega?: number;
+  last_trade_price?: number;
+}
+
+// Parse an OCC option symbol like "AAPL250117C00100000" into its parts.
+// Layout: <ROOT><YY><MM><DD><C|P><STRIKE*1000 padded to 8>. The root is
+// variable-length; the last 15 chars are fixed.
+function parseOccSymbol(occ: string): {
+  expirationUnix: number;
+  expirationDate: string;
+  kind: 'call' | 'put';
+  strike: number;
+} | null {
+  if (occ.length < 16) return null;
+  const tail = occ.slice(-15);
+  const yy = tail.slice(0, 2);
+  const mm = tail.slice(2, 4);
+  const dd = tail.slice(4, 6);
+  const typeChar = tail[6];
+  const strikeStr = tail.slice(7);
+  if (!/^\d{2}$/.test(yy) || !/^\d{2}$/.test(mm) || !/^\d{2}$/.test(dd)) return null;
+  if (typeChar !== 'C' && typeChar !== 'P') return null;
+  if (!/^\d{8}$/.test(strikeStr)) return null;
+  const isoDate = `20${yy}-${mm}-${dd}`;
+  const expirationUnix = Math.floor(Date.parse(isoDate + 'T20:00:00Z') / 1000);
+  if (!Number.isFinite(expirationUnix)) return null;
+  return {
+    expirationUnix,
+    expirationDate: isoDate,
+    kind: typeChar === 'C' ? 'call' : 'put',
+    strike: Number(strikeStr) / 1000,
+  };
+}
+
+// CBOE public delayed-quotes endpoint. No auth, ~15-min delayed, ships
+// greeks pre-computed. Returns null when the symbol isn't listed so the
+// caller can fall through.
+async function tryCboeChain(
+  symbol: string,
+  expirationTs: number | null,
+): Promise<OptionsChainResponse | null> {
+  // Strip a leading '^' for indices — CBOE uses an underscore prefix instead
+  // (e.g. ^SPX → _SPX.json). The Options UI already filters '^' tickers, but
+  // keep this here for completeness.
+  const cboeSymbol = symbol.startsWith('^') ? `_${symbol.slice(1)}` : symbol;
+  const url = `https://cdn.cboe.com/api/global/delayed_quotes/options/${encodeURIComponent(cboeSymbol)}.json`;
+  try {
+    const res = await fetch(url, {
+      headers: {
+        // CBOE's CDN is content-type-strict — Accept matters.
+        Accept: 'application/json',
+        'User-Agent': 'Mozilla/5.0 (compatible; stock-tracker/1.0)',
+      },
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!res.ok) return null;
+    const json = (await res.json()) as CboeOptionsResponse;
+    const data = json.data;
+    if (!data || !Array.isArray(data.options) || data.options.length === 0) return null;
+
+    const spot = typeof data.current_price === 'number' && data.current_price > 0
+      ? data.current_price
+      : (typeof data.bid === 'number' && typeof data.ask === 'number'
+        ? (data.bid + data.ask) / 2
+        : 0);
+
+    // Group contracts by expiration date.
+    const byExp = new Map<string, { unix: number; calls: OptionContract[]; puts: OptionContract[] }>();
+    for (const raw of data.options) {
+      if (!raw.option) continue;
+      const parsed = parseOccSymbol(raw.option);
+      if (!parsed) continue;
+      const bucket = byExp.get(parsed.expirationDate) ?? {
+        unix: parsed.expirationUnix,
+        calls: [],
+        puts: [],
+      };
+      const inTheMoney = spot > 0
+        ? (parsed.kind === 'call' ? spot > parsed.strike : spot < parsed.strike)
+        : false;
+      const contract: OptionContract = {
+        contractSymbol: raw.option,
+        strike: parsed.strike,
+        bid: typeof raw.bid === 'number' ? raw.bid : null,
+        ask: typeof raw.ask === 'number' ? raw.ask : null,
+        last: typeof raw.last_trade_price === 'number' ? raw.last_trade_price : null,
+        volume: typeof raw.volume === 'number' ? raw.volume : null,
+        openInterest: typeof raw.open_interest === 'number' ? raw.open_interest : null,
+        impliedVolatility: typeof raw.iv === 'number' ? raw.iv : null,
+        inTheMoney,
+        delta: typeof raw.delta === 'number' ? raw.delta : null,
+        gamma: typeof raw.gamma === 'number' ? raw.gamma : null,
+        theta: typeof raw.theta === 'number' ? raw.theta : null,
+        vega: typeof raw.vega === 'number' ? raw.vega : null,
+      };
+      if (parsed.kind === 'call') bucket.calls.push(contract);
+      else bucket.puts.push(contract);
+      byExp.set(parsed.expirationDate, bucket);
+    }
+
+    if (byExp.size === 0) return null;
+
+    const sortedExps = [...byExp.entries()].sort((a, b) => a[1].unix - b[1].unix);
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    // Pick the requested expiration (match by date), else the nearest
+    // future one.
+    let pickedDate: string;
+    if (expirationTs) {
+      const wantedDate = new Date(expirationTs * 1000).toISOString().slice(0, 10);
+      pickedDate = sortedExps.find(([d]) => d === wantedDate)?.[0]
+        ?? sortedExps.find(([, b]) => b.unix >= nowSec)?.[0]
+        ?? sortedExps[0]![0];
+    } else {
+      pickedDate = sortedExps.find(([, b]) => b.unix >= nowSec)?.[0] ?? sortedExps[0]![0];
+    }
+    const picked = byExp.get(pickedDate)!;
+    const daysToExpiry = Math.max(0, (picked.unix - nowSec) / 86400);
+
+    return {
+      symbol,
+      spot,
+      expiration: picked.unix,
+      expirationDate: pickedDate,
+      daysToExpiry: Math.round(daysToExpiry * 10) / 10,
+      availableExpirations: sortedExps.map(([, b]) => b.unix),
+      calls: picked.calls.sort((a, b) => a.strike - b.strike),
+      puts: picked.puts.sort((a, b) => a.strike - b.strike),
+    };
+  } catch {
+    return null;
+  }
 }
 
 // Finnhub options chain. Returns null when the endpoint is paid-tier-gated

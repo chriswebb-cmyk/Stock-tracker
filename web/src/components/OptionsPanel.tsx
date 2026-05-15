@@ -201,9 +201,10 @@ export function OptionsPanel({ tickers }: Props) {
       )}
 
       <div className="text-xs text-slate-500 pt-2 border-t border-slate-800">
-        Data: Yahoo Finance (free, ~15min delayed for some symbols). Greeks computed via
-        Black-Scholes using the latest 10-year Treasury yield as the risk-free rate
-        (zero dividend assumption). ATM row highlighted; ITM strikes shown in the side's color.
+        Data: CBOE delayed quotes (free, ~15min delayed), with Finnhub/Yahoo as fallbacks.
+        Greeks are exchange-published when available, otherwise computed via Black-Scholes
+        using the latest 10-year Treasury yield as the risk-free rate (zero dividend
+        assumption). ATM row highlighted; ITM strikes shown in the side's color.
       </div>
     </div>
   );
