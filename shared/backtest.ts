@@ -1,5 +1,17 @@
 import type { Bar } from './types';
-import { aggregateTo, atr, bollinger, ema, etDayKey, isNum, rsi, volRegime, vwap } from './indicators';
+import {
+  aggregateTo,
+  atr,
+  bollinger,
+  ema,
+  etDayKey,
+  isNum,
+  rsi,
+  trendStrength,
+  volRegime,
+  vpocToday,
+  vwap,
+} from './indicators';
 import type { DetectedSignal, SetupName } from './setups';
 import { buildFeatures, type FeatureName } from './features';
 
@@ -59,6 +71,10 @@ interface DayInfo {
   orbReadyIndex: number;
   brokeUp: boolean;
   brokeDown: boolean;
+  // Full-day high/low filled in after days[] is built; used to expose
+  // prior-day H/L as features.
+  priorHigh: number;
+  priorLow: number;
 }
 
 export function backtest(
@@ -109,18 +125,33 @@ export function backtest(
         orbReadyIndex: -1,
         brokeUp: false,
         brokeDown: false,
+        priorHigh: -Infinity,
+        priorLow: Infinity,
       });
     }
   }
 
-  for (const day of days) {
-    const end = Math.min(day.startIndex + ORB_MINUTES, bars.length);
-    for (let i = day.startIndex; i < end; i++) {
+  for (let d = 0; d < days.length; d++) {
+    const day = days[d]!;
+    const dayEnd = d + 1 < days.length ? days[d + 1]!.startIndex : bars.length;
+    // Full-day high/low (used for prior-day features by the NEXT day).
+    let dh = -Infinity;
+    let dl = Infinity;
+    for (let i = day.startIndex; i < dayEnd; i++) {
+      const b = bars[i]!;
+      if (b.high > dh) dh = b.high;
+      if (b.low < dl) dl = b.low;
+    }
+    day.priorHigh = dh;
+    day.priorLow = dl;
+    // ORB high/low using just the first ORB_MINUTES bars.
+    const orbEnd = Math.min(day.startIndex + ORB_MINUTES, dayEnd);
+    for (let i = day.startIndex; i < orbEnd; i++) {
       const b = bars[i]!;
       if (b.high > day.orbHigh) day.orbHigh = b.high;
       if (b.low < day.orbLow) day.orbLow = b.low;
     }
-    if (end - day.startIndex >= ORB_MINUTES) {
+    if (orbEnd - day.startIndex >= ORB_MINUTES) {
       day.orbReadyIndex = day.startIndex + ORB_MINUTES;
     }
   }
@@ -163,6 +194,14 @@ export function backtest(
     const regime = volRegime(bars, atrSeries, entryIndex, VOL_REGIME_LOOKBACK);
     const ema5 = mtf5[entryIndex];
     const ema15 = mtf15[entryIndex];
+    // Structural per-trade features. Compute against bars up to entryIndex
+    // so we don't lookahead into bars the live signal wouldn't have seen.
+    const barsUpTo = bars.slice(0, entryIndex + 1);
+    const todayBars = barsUpTo.filter((b) => etDayKey(b.ts) === dayKeys[entryIndex]);
+    const todayOpen = todayBars[0]?.open;
+    const vpoc = vpocToday(barsUpTo, etDayKey);
+    const trend = trendStrength(barsUpTo, 60, 3);
+    const prior = dayIdx > 0 ? days[dayIdx - 1]! : null;
     const features = buildFeatures({
       close: entryBar.close,
       prevClose: day.prevClose,
@@ -173,8 +212,14 @@ export function backtest(
       atr: isNum(lastAtr) ? lastAtr : 0,
       ts: entryBar.ts,
       volRegime: regime,
-      // VIX/Reddit/Options context is not historically available in backtest;
-      // those features fall back to neutral defaults in buildFeatures.
+      pdh: prior?.priorHigh,
+      pdl: prior?.priorLow,
+      pdClose: day.prevClose,
+      todayOpen,
+      vpoc: isNum(vpoc) ? vpoc : undefined,
+      trendStrength: trend,
+      // VIX/Reddit/Options/SPY/TNX/earnings context isn't historically
+      // available in backtest; those features fall back to neutral defaults.
       context: {
         ema5mDist: isNum(ema5) && entryBar.close > 0 ? (entryBar.close - ema5) / entryBar.close : 0,
         ema15mDist: isNum(ema15) && entryBar.close > 0 ? (entryBar.close - ema15) / entryBar.close : 0,

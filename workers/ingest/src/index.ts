@@ -10,6 +10,7 @@ import {
   upsertBars,
 } from './db';
 import { detectSetups } from '../../../shared/setups';
+import { isUsRegularHours } from '../../../shared/indicators';
 import { postDiscordSignals, type DiscordSignal } from './discord';
 import { modelFromJson, predict, type Model } from '../../../shared/ml';
 import { featuresToVector, type SignalContext } from '../../../shared/features';
@@ -31,13 +32,11 @@ export interface Env {
 }
 
 function isMarketHoursEt(d: Date): boolean {
-  const dow = d.getUTCDay();
-  if (dow === 0 || dow === 6) return false;
-  const utcHour = d.getUTCHours();
-  const utcMin = d.getUTCMinutes();
-  const etHour = (utcHour - 4 + 24) % 24;
-  const minutesEt = etHour * 60 + utcMin;
-  return minutesEt >= 9 * 60 + 30 && minutesEt < 16 * 60;
+  // Delegates to shared/indicators.isUsRegularHours so DST is handled
+  // properly. The previous fixed -4h offset silently mis-bucketed half the
+  // year — under EST it polled 08:30-15:00 ET, missing the closing hour
+  // and wasting invocations on pre-market.
+  return isUsRegularHours(Math.floor(d.getTime() / 1000));
 }
 
 export default {
@@ -233,12 +232,15 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
     await upsertBars(env.DB, allBars);
   }
 
-  // Build per-scan context once: VIX (shared), Reddit & options per symbol.
-  // These are best-effort — any query failure leaves context fields neutral
-  // so signal detection still runs.
-  const vixCtx = await loadVixContext(env.DB);
+  // Build per-scan context once: VIX/TNX/SPY are global; Reddit, options
+  // and earnings are per-symbol. Best-effort — any query failure leaves the
+  // corresponding context fields neutral so signal detection still runs.
+  const vixCtx = await loadIndexContext(env.DB, '^VIX', 'vix');
+  const tnxCtx = await loadIndexContext(env.DB, '^TNX', 'tnx');
+  const spyCtx = await loadSpyContext(env.DB);
   const redditBySymbol = await loadRedditContext(env.DB, symbols);
   const optionsBySymbol = await loadOptionsContext(env.DB, symbols);
+  const earningsBySymbol = await loadEarningsContext(env, symbols);
 
   // In-memory setup detection per symbol.
   const signalsToFire: DiscordSignal[] = [];
@@ -256,8 +258,11 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
     if (f.bars.length < 30 || f.prevClose === null) continue;
     const symbolContext: SignalContext = {
       ...vixCtx,
+      ...tnxCtx,
+      ...spyCtx,
       ...(redditBySymbol.get(f.symbol) ?? {}),
       ...(optionsBySymbol.get(f.symbol) ?? {}),
+      ...(earningsBySymbol.get(f.symbol) ?? {}),
     };
     const detected = detectSetups(f.symbol, f.bars, f.prevClose, symbolContext);
     for (const sig of detected) {
@@ -336,25 +341,136 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
   };
 }
 
-// Fetch the latest two VIX closes from D1 so we can pass {level, delta}
-// to the signal detector. Empty object if VIX isn't in the watchlist or
-// hasn't been ingested yet.
-async function loadVixContext(db: D1Database): Promise<SignalContext> {
+// Loads the latest level + delta for an index symbol (^VIX, ^TNX, etc.)
+// and returns it as a SignalContext under the appropriate key prefix.
+// Empty object if the symbol hasn't been ingested yet.
+async function loadIndexContext(
+  db: D1Database,
+  symbol: string,
+  prefix: 'vix' | 'tnx',
+): Promise<SignalContext> {
   try {
     const { results } = await db
       .prepare(
         `SELECT close FROM bars
-          WHERE symbol = '^VIX' AND interval = '1min'
+          WHERE symbol = ? AND interval = '1min'
           ORDER BY ts DESC
           LIMIT 2`,
       )
+      .bind(symbol)
       .all<{ close: number }>();
     if (results.length === 0) return {};
     const latest = results[0]!.close;
     const prev = results[1]?.close ?? latest;
-    return { vixLevel: latest, vixDelta: latest - prev };
+    return prefix === 'vix'
+      ? { vixLevel: latest, vixDelta: latest - prev }
+      : { tnxLevel: latest, tnxDelta: latest - prev };
   } catch {
     return {};
+  }
+}
+
+// SPY intraday return: today's latest close vs today's open. Used as a
+// relative-strength baseline for every other symbol's signal.
+async function loadSpyContext(db: D1Database): Promise<SignalContext> {
+  try {
+    const latestRow = await db
+      .prepare(
+        `SELECT ts, close FROM bars
+          WHERE symbol='SPY' AND interval='1min'
+          ORDER BY ts DESC LIMIT 1`,
+      )
+      .first<{ ts: number; close: number }>();
+    if (!latestRow) return {};
+    // Find SPY's first bar of the same trading day. We can't use etDayKey
+    // here without importing it; the 14h window is conservative enough to
+    // cover from 09:30 ET to 16:00 ET regardless of DST.
+    const open = await db
+      .prepare(
+        `SELECT open FROM bars
+          WHERE symbol='SPY' AND interval='1min' AND ts >= ? AND ts <= ?
+          ORDER BY ts ASC LIMIT 1`,
+      )
+      .bind(latestRow.ts - 14 * 3600, latestRow.ts)
+      .first<{ open: number }>();
+    if (!open || open.open <= 0) return {};
+    return { spyReturnPct: (latestRow.close - open.open) / open.open };
+  } catch {
+    return {};
+  }
+}
+
+// Earnings calendar via Finnhub. Cached for 12h in json_cache so we don't
+// burn the 60-req/min budget on every scan. Returns days-to-earnings per
+// symbol; symbols with no upcoming announcement on file get 30 (the cap).
+async function loadEarningsContext(
+  env: Env,
+  symbols: string[],
+): Promise<Map<string, SignalContext>> {
+  const out = new Map<string, SignalContext>();
+  if (symbols.length === 0 || !env.FINNHUB_API_KEY) return out;
+  // Read from cache if fresh, otherwise refresh.
+  const now = Math.floor(Date.now() / 1000);
+  let cached: Record<string, string> | null = null;
+  try {
+    const row = await env.DB
+      .prepare(`SELECT value, updated_at FROM json_cache WHERE key='earnings-calendar'`)
+      .first<{ value: string; updated_at: number }>();
+    if (row && now - row.updated_at < 12 * 3600) {
+      cached = JSON.parse(row.value) as Record<string, string>;
+    }
+  } catch {
+    // json_cache table may not exist on older DBs; soft-fail to refresh.
+  }
+  if (!cached) {
+    cached = await fetchEarningsCalendar(env.FINNHUB_API_KEY);
+    if (cached) {
+      try {
+        await env.DB
+          .prepare(
+            `INSERT INTO json_cache(key, value, updated_at)
+             VALUES ('earnings-calendar', ?, ?)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+          )
+          .bind(JSON.stringify(cached), now)
+          .run();
+      } catch {
+        // Cache write is best-effort.
+      }
+    }
+  }
+  if (!cached) return out;
+  const today = new Date(now * 1000);
+  for (const sym of symbols) {
+    const dateStr = cached[sym];
+    if (!dateStr) continue;
+    const earningsDate = new Date(dateStr + 'T12:00:00Z');
+    const days = Math.max(0, Math.round((earningsDate.getTime() - today.getTime()) / 86400000));
+    if (days <= 60) out.set(sym, { daysToEarnings: days });
+  }
+  return out;
+}
+
+async function fetchEarningsCalendar(apiKey: string): Promise<Record<string, string> | null> {
+  // Finnhub returns symbol-keyed announcements for a date range. Pull the
+  // next ~30 days. Wall-clock-bounded so a hung response doesn't kill the
+  // run.
+  try {
+    const start = new Date().toISOString().slice(0, 10);
+    const endDate = new Date(Date.now() + 35 * 86400000).toISOString().slice(0, 10);
+    const url = `https://finnhub.io/api/v1/calendar/earnings?from=${start}&to=${endDate}&token=${apiKey}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+    if (!res.ok) return null;
+    const json = (await res.json()) as { earningsCalendar?: Array<{ symbol: string; date: string }> };
+    const map: Record<string, string> = {};
+    for (const e of json.earningsCalendar ?? []) {
+      if (!e.symbol || !e.date) continue;
+      // First (= earliest) date per symbol wins.
+      if (!(e.symbol in map)) map[e.symbol] = e.date;
+    }
+    return map;
+  } catch {
+    return null;
   }
 }
 

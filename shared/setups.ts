@@ -1,5 +1,18 @@
 import type { Bar } from './types';
-import { aggregateTo, atr, bollinger, ema, etDayKey, isNum, rsi, volRegime, vwap, type BollingerBand } from './indicators';
+import {
+  aggregateTo,
+  atr,
+  bollinger,
+  ema,
+  etDayKey,
+  isNum,
+  rsi,
+  trendStrength,
+  volRegime,
+  vpocToday,
+  vwap,
+  type BollingerBand,
+} from './indicators';
 import { buildFeatures, type SignalContext } from './features';
 
 export type SetupName =
@@ -64,15 +77,14 @@ export function detectSetups(
   const changePct = prevClose > 0 ? (last.close - prevClose) / prevClose : 0;
 
   const regime = volRegime(bars, atrSeries, i, VOL_REGIME_LOOKBACK);
-  // Multi-timeframe EMA distances. Compute the 5m/15m aggregates from the
-  // 1-min bars we already have so we don't need separate higher-timeframe
-  // data fetches.
   const ema5mDist = computeEmaDist(bars, 5 * 60, 9, last.close);
   const ema15mDist = computeEmaDist(bars, 15 * 60, 9, last.close);
   const mergedContext: SignalContext = { ...context, ema5mDist, ema15mDist };
-  // Build the ML-ready feature vector once. setups.ts is responsible for
-  // putting FEATURE_NAMES-keyed values into sig.features so that live
-  // inference (featuresToVector(sig.features)) finds them by name.
+  // Round 2 structural features computed from the bars themselves.
+  const priorDay = findPriorDay(bars, todayKey);
+  const todayOpen = todaysBars[0]?.open;
+  const vpoc = vpocToday(bars, etDayKey);
+  const trend = trendStrength(bars, 60, 3);
   const mlFeatures = buildFeatures({
     close: last.close,
     prevClose,
@@ -83,6 +95,12 @@ export function detectSetups(
     atr: isNum(lastAtr) ? lastAtr : 0,
     ts: last.ts,
     volRegime: regime,
+    pdh: priorDay?.high,
+    pdl: priorDay?.low,
+    pdClose: priorDay?.close,
+    todayOpen,
+    vpoc: isNum(vpoc) ? vpoc : undefined,
+    trendStrength: trend,
     context: mergedContext,
   });
   const baseFeatures: Record<string, number> = {
@@ -252,6 +270,29 @@ export function detectSetups(
   }
 
   return out;
+}
+
+// Returns OHLC summary for the most recent trading day strictly before
+// `todayKey`. Used to expose prior day high/low/close as features.
+function findPriorDay(bars: Bar[], todayKey: string): { high: number; low: number; close: number } | null {
+  let high = -Infinity;
+  let low = Infinity;
+  let close = NaN;
+  let lastKey = '';
+  for (let i = bars.length - 1; i >= 0; i--) {
+    const b = bars[i]!;
+    const k = etDayKey(b.ts);
+    if (k === todayKey) continue;
+    if (lastKey === '') {
+      lastKey = k;
+      close = b.close; // most recent bar of the prior day is the day's close
+    }
+    if (k !== lastKey) break;
+    if (b.high > high) high = b.high;
+    if (b.low < low) low = b.low;
+  }
+  if (!Number.isFinite(high) || !Number.isFinite(low) || !Number.isFinite(close)) return null;
+  return { high, low, close };
 }
 
 // Aggregates the 1-min bars to `bucketSec` resolution, computes EMA(`period`)

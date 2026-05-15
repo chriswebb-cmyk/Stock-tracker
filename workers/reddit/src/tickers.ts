@@ -116,7 +116,11 @@ export const TICKER_DENYLIST: ReadonlySet<string> = new Set([
   'NSFL', 'GG', 'WP', 'GL', 'HF', 'EZ', 'SMH', 'LMAO', 'LOL', 'WTF', 'OMG',
   'AF', 'BS', 'BTW', 'IDK', 'IDC', 'TBH', 'TYSM', 'NGMI', 'WAGMI', 'RIP', 'GZ',
   'USA', 'UK', 'EU', 'UN', 'NATO', 'CCP', 'CIA', 'FBI', 'NSA', 'IRS', 'SBA',
-  'API', 'CEO', 'AI', 'ML', 'AGI', 'LLM', 'GPU', 'CPU', 'RAM', 'SSD', 'HDD',
+  // 'AI' deliberately omitted — it's both a real ticker (C3.ai) AND used
+  // generically. Universe match keeps cashtag/uppercase $AI mentions; the
+  // generic English use is rare enough that false-positives don't outweigh
+  // the loss of C3.ai chatter.
+  'API', 'CEO', 'ML', 'AGI', 'LLM', 'GPU', 'CPU', 'RAM', 'SSD', 'HDD',
   'TV', 'PC', 'OS', 'DEX', 'CEX', 'NFT', 'POS', 'POW', 'KYC', 'AML', 'TOS',
   'PT', 'SL', 'TP', 'OB', 'FOMO', 'FUD', 'ATH', 'ATL', 'BTD', 'BTFD',
 ]);

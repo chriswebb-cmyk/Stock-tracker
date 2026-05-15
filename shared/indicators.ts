@@ -141,15 +141,127 @@ export function vwap(bars: Bar[], dayKey: (ts: number) => string): number[] {
   return out;
 }
 
-// Returns 'YYYY-MM-DD' for an ET trading day. Fixed -4h (EDT) offset to
-// avoid IANA tz dependencies inside Workers.
+// US Eastern offset in hours for a given UTC instant, accounting for DST.
+// DST: second Sunday of March 02:00 ET -> first Sunday of November 02:00 ET.
+// Returns 4 during EDT and 5 during EST. Pure math; no IANA tz needed inside
+// Workers.
+export function etOffsetHours(tsSeconds: number): number {
+  const utc = new Date(tsSeconds * 1000);
+  const y = utc.getUTCFullYear();
+  const dstStart = nthSundayUtc(y, 3, 2, 7); // 2nd Sunday of March, 07:00 UTC = 02:00 EST
+  const dstEnd = nthSundayUtc(y, 11, 1, 6);  // 1st Sunday of November, 06:00 UTC = 02:00 EDT
+  return tsSeconds * 1000 >= dstStart && tsSeconds * 1000 < dstEnd ? 4 : 5;
+}
+
+// 'YYYY-MM-DD' for the ET trading day covering this UTC instant. Uses the
+// DST-aware offset so trading-day boundaries don't shift by an hour twice a
+// year (which silently corrupted VWAP/ORB groupings in the previous fixed
+// -4h implementation).
 export function etDayKey(tsSeconds: number): string {
-  const ms = (tsSeconds - 4 * 3600) * 1000;
+  const ms = (tsSeconds - etOffsetHours(tsSeconds) * 3600) * 1000;
   const d = new Date(ms);
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, '0');
   const day = String(d.getUTCDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
+}
+
+// Returns true if the instant is inside US regular trading hours (09:30 -
+// 16:00 ET, Mon-Fri), accounting for DST. Replaces the fixed -4h offset
+// version in the ingest/reddit workers that silently mis-bucketed half the
+// year (polling 08:30-15:00 ET in winter instead of 09:30-16:00 ET).
+export function isUsRegularHours(tsSeconds: number): boolean {
+  const offset = etOffsetHours(tsSeconds);
+  const utc = new Date(tsSeconds * 1000);
+  const dow = utc.getUTCDay();
+  if (dow === 0 || dow === 6) return false;
+  const totalUtcMin = utc.getUTCHours() * 60 + utc.getUTCMinutes();
+  const etMin = (totalUtcMin - offset * 60 + 1440) % 1440;
+  return etMin >= 9 * 60 + 30 && etMin < 16 * 60;
+}
+
+// Returns Unix ms of the nth occurrence of `weekday` (0=Sun..6=Sat) in
+// `month1to12` of `year`, at `hourUtc:00:00`. Used to compute DST boundaries.
+function nthSundayUtc(year: number, month1to12: number, n: number, hourUtc: number): number {
+  const firstOfMonth = Date.UTC(year, month1to12 - 1, 1);
+  const firstDow = new Date(firstOfMonth).getUTCDay();
+  const daysToFirstSunday = (7 - firstDow) % 7;
+  const dom = 1 + daysToFirstSunday + (n - 1) * 7;
+  return Date.UTC(year, month1to12 - 1, dom, hourUtc, 0, 0);
+}
+
+// Volume Point of Control for today's session: the price level (rounded
+// to a granularity that's a fraction of the daily range) that traded the
+// most volume. Returns NaN if there isn't enough today-data to compute.
+export function vpocToday(bars: Bar[], dayKey: (ts: number) => string): number {
+  if (bars.length === 0) return NaN;
+  const lastKey = dayKey(bars[bars.length - 1]!.ts);
+  const today = bars.filter((b) => dayKey(b.ts) === lastKey);
+  if (today.length < 10) return NaN;
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const b of today) {
+    if (b.low < lo) lo = b.low;
+    if (b.high > hi) hi = b.high;
+  }
+  const range = hi - lo;
+  if (range <= 0) return today[today.length - 1]!.close;
+  // Bucket into ~50 bins; vol is split evenly across the bar's H-L span.
+  const BIN_COUNT = 50;
+  const binSize = range / BIN_COUNT;
+  const bins = new Array<number>(BIN_COUNT + 1).fill(0);
+  for (const b of today) {
+    const startBin = Math.max(0, Math.floor((b.low - lo) / binSize));
+    const endBin = Math.min(BIN_COUNT, Math.floor((b.high - lo) / binSize));
+    const spanBins = Math.max(1, endBin - startBin + 1);
+    const volPerBin = b.volume / spanBins;
+    for (let k = startBin; k <= endBin; k++) bins[k]! += volPerBin;
+  }
+  let bestIdx = 0;
+  let bestVol = -1;
+  for (let k = 0; k < bins.length; k++) {
+    if (bins[k]! > bestVol) {
+      bestVol = bins[k]!;
+      bestIdx = k;
+    }
+  }
+  return lo + (bestIdx + 0.5) * binSize;
+}
+
+// Trend strength: simple swing detector over the last `lookback` bars.
+// Scans for local highs / lows (each higher than its `pivot` neighbours on
+// both sides) and counts higher-highs / higher-lows minus lower-highs /
+// lower-lows. Result normalised to [-1, 1] by total swing count. Captures
+// directional pressure that EMAs alone miss.
+export function trendStrength(bars: Bar[], lookback = 60, pivot = 3): number {
+  const end = bars.length;
+  const start = Math.max(pivot, end - lookback);
+  const highs: number[] = [];
+  const lows: number[] = [];
+  for (let i = start; i < end - pivot; i++) {
+    const cur = bars[i]!;
+    let isHigh = true;
+    let isLow = true;
+    for (let k = 1; k <= pivot; k++) {
+      const l = bars[i - k]!;
+      const r = bars[i + k]!;
+      if (l.high >= cur.high || r.high >= cur.high) isHigh = false;
+      if (l.low <= cur.low || r.low <= cur.low) isLow = false;
+    }
+    if (isHigh) highs.push(cur.high);
+    if (isLow) lows.push(cur.low);
+  }
+  let score = 0;
+  let total = 0;
+  for (let i = 1; i < highs.length; i++) {
+    total++;
+    score += highs[i]! > highs[i - 1]! ? 1 : -1;
+  }
+  for (let i = 1; i < lows.length; i++) {
+    total++;
+    score += lows[i]! > lows[i - 1]! ? 1 : -1;
+  }
+  return total === 0 ? 0 : score / total;
 }
 
 // Roll 1-min bars into a higher timeframe by floor-bucketing on bucketSec.

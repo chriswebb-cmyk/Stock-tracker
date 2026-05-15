@@ -11,25 +11,26 @@ export const FEATURE_NAMES = [
   'min_of_day',
   'dow_norm',
   'vol_regime',
-  // Step 3: cyclic encoding of time of day. Lets a linear model express
-  // U-shaped intraday patterns (morning trend / lunch chop / power hour)
-  // that min_of_day alone can't represent.
   'tod_sin',
   'tod_cos',
-  // Step 4: VIX regime. Normalized so 0 ≈ calm market, 1 ≈ panic.
   'vix_level_norm',
   'vix_delta_norm',
-  // Step 6: Reddit chatter intensity and sentiment for this symbol.
   'reddit_velocity',
   'reddit_sentiment',
-  // Step 7: multi-timeframe agreement. Distance from EMA(9) computed on
-  // 5-min and 15-min bars, signed by the underlying 1-min direction.
   'mtf_5m_ema_dist',
   'mtf_15m_ema_dist',
-  // Step 8: options-derived features. P/C ratio normalized so neutral=0;
-  // gamma_concentration is the fraction of OI within ±2% of spot.
   'pc_ratio_norm',
   'gamma_concentration',
+  // Round 2: structural / cross-asset features.
+  'dist_pdh',         // (close - prev day high) / close
+  'dist_pdl',         // (close - prev day low) / close
+  'gap_pct',          // (today open - prev close) / prev close
+  'vpoc_dist',        // (close - today's volume POC) / close
+  'trend_strength',   // -1..1, net of HH/HL vs LH/LL over recent swings
+  'spy_rel_return',   // (this symbol's intraday change) - (SPY's intraday change), normalised
+  'tnx_level_norm',   // 10Y yield normalised to 0..1 over 1..6%
+  'tnx_delta_norm',   // daily change normalised to -1..1
+  'days_to_earnings', // 1 = earnings today, 0 = >=30 days out
 ] as const;
 
 export type FeatureName = typeof FEATURE_NAMES[number];
@@ -42,67 +43,84 @@ export interface FeatureInput {
   bbLower: number;
   bbUpper: number;
   atr: number;
-  ts: number; // unix seconds, bar open time
-  // 0..1 percentile rank of recent ATR/price vs the trailing window. Caller
-  // computes via volRegime(); 0.5 if there isn't enough warmup history.
+  ts: number;
   volRegime: number;
-  // Optional cross-asset / external context. When absent, the corresponding
-  // features fall back to neutral values so models trained without context
-  // don't degrade on the missing dimensions.
+  // Round 2: caller-computed structural inputs. Optional — defaults are
+  // neutral so older callers keep working without code changes.
+  pdh?: number;             // prior day high
+  pdl?: number;             // prior day low
+  pdClose?: number;         // prior day close (used together with todayOpen for gap)
+  todayOpen?: number;       // today's first bar open
+  vpoc?: number;            // today's volume-weighted POC price
+  trendStrength?: number;   // -1..1 HH/HL count vs LH/LL
   context?: SignalContext;
 }
 
 export interface SignalContext {
-  // VIX
-  vixLevel?: number;       // raw VIX index value (e.g. 14.5)
-  vixDelta?: number;       // VIX change vs previous close (raw points)
-  // Reddit / WSB
-  redditVelocity?: number; // ratio: mentions(last 1h) / mentions(prior 24h avg per hour)
-  redditSentiment?: number; // -1..1, average sentiment across mentioning posts
-  // Options
-  pcRatio?: number;             // put volume / call volume for the underlying
-  gammaConcentration?: number;  // OI fraction in strikes within ±2% of spot (0..1)
-  // Multi-timeframe
-  ema5mDist?: number;   // (close - ema9_on_5m) / close
-  ema15mDist?: number;  // (close - ema9_on_15m) / close
+  vixLevel?: number;
+  vixDelta?: number;
+  redditVelocity?: number;
+  redditSentiment?: number;
+  pcRatio?: number;
+  gammaConcentration?: number;
+  ema5mDist?: number;
+  ema15mDist?: number;
+  // Round 2 context fields.
+  spyReturnPct?: number;    // SPY's intraday return, decimal
+  tnxLevel?: number;        // 10Y treasury yield, % (e.g. 4.35)
+  tnxDelta?: number;        // daily change in yield, % points
+  daysToEarnings?: number;  // calendar days; 0 if today, >=30 if far out
 }
 
 export function buildFeatures(opts: FeatureInput): Record<FeatureName, number> {
   const date = new Date(opts.ts * 1000);
-  // Approximate ET = UTC - 4h (EDT).
   const etMin = (date.getUTCHours() * 60 + date.getUTCMinutes() - 4 * 60 + 1440) % 1440;
   const minSinceOpen = etMin - (9 * 60 + 30);
-  const dow = date.getUTCDay(); // 0=Sun..6=Sat
+  const dow = date.getUTCDay();
   const bbRange = opts.bbUpper - opts.bbLower;
   const minOfDayNorm = Math.max(0, Math.min(389, minSinceOpen)) / 389;
   const angle = 2 * Math.PI * minOfDayNorm;
   const ctx = opts.context ?? {};
+  const changePct = opts.prevClose > 0 ? (opts.close - opts.prevClose) / opts.prevClose : 0;
+  // SPY-relative: this symbol's intraday move minus SPY's. Positive = stronger
+  // than market. ctx.spyReturnPct is the SPY change; if missing, the relative
+  // collapses to 0 (neutral). Magnify by 10 then clamp to keep the feature
+  // in roughly [-1, 1] like other normalized inputs.
+  const spyRel = ctx.spyReturnPct === undefined ? 0 : changePct - ctx.spyReturnPct;
   return {
-    change_pct: opts.prevClose > 0 ? (opts.close - opts.prevClose) / opts.prevClose : 0,
+    change_pct: changePct,
     rsi_norm: opts.rsi / 100,
     vwap_dist: opts.vwap > 0 ? (opts.close - opts.vwap) / opts.vwap : 0,
     bb_pos: bbRange > 0 ? (opts.close - opts.bbLower) / bbRange : 0.5,
     atr_ratio: opts.close > 0 ? opts.atr / opts.close : 0,
     min_of_day: minOfDayNorm,
     dow_norm: Math.max(0, Math.min(1, (dow - 1) / 4)),
-    vol_regime: Math.max(0, Math.min(1, opts.volRegime)),
+    vol_regime: clamp01(opts.volRegime),
     tod_sin: Math.sin(angle),
     tod_cos: Math.cos(angle),
-    // VIX 12 ≈ historically calm, 30+ ≈ panic. Normalize so 12 maps to 0
-    // and 42 to 1, then clamp.
     vix_level_norm: clamp01(((ctx.vixLevel ?? 18) - 12) / 30),
-    // Daily VIX moves typically within ±5; normalize to [-1, 1].
     vix_delta_norm: clamp((ctx.vixDelta ?? 0) / 5, -1, 1),
-    // Reddit velocity is a ratio; cap at 5x to avoid runaway values.
     reddit_velocity: clamp((ctx.redditVelocity ?? 1) / 5, 0, 1),
     reddit_sentiment: clamp(ctx.redditSentiment ?? 0, -1, 1),
-    // Multi-timeframe EMA distances (-1..1 after clamp; raw values are
-    // typically <0.05).
     mtf_5m_ema_dist: clamp(ctx.ema5mDist ?? 0, -0.1, 0.1) * 10,
     mtf_15m_ema_dist: clamp(ctx.ema15mDist ?? 0, -0.1, 0.1) * 10,
-    // P/C ratio: 1.0 is neutral, >1 bearish bias. Center on 0 and clamp.
     pc_ratio_norm: clamp(((ctx.pcRatio ?? 1) - 1) / 1.5, -1, 1),
     gamma_concentration: clamp01(ctx.gammaConcentration ?? 0),
+    dist_pdh: opts.pdh && opts.close > 0 ? clamp((opts.close - opts.pdh) / opts.close, -0.2, 0.2) * 5 : 0,
+    dist_pdl: opts.pdl && opts.close > 0 ? clamp((opts.close - opts.pdl) / opts.close, -0.2, 0.2) * 5 : 0,
+    gap_pct:
+      opts.todayOpen && opts.pdClose && opts.pdClose > 0
+        ? clamp((opts.todayOpen - opts.pdClose) / opts.pdClose, -0.1, 0.1) * 10
+        : 0,
+    vpoc_dist: opts.vpoc && opts.close > 0 ? clamp((opts.close - opts.vpoc) / opts.close, -0.1, 0.1) * 10 : 0,
+    trend_strength: clamp(opts.trendStrength ?? 0, -1, 1),
+    spy_rel_return: clamp(spyRel, -0.05, 0.05) * 20,
+    // TNX is reported in % (e.g. 4.35). Normalize so 1% maps to 0 and 6% to 1.
+    tnx_level_norm: clamp01(((ctx.tnxLevel ?? 4) - 1) / 5),
+    tnx_delta_norm: clamp((ctx.tnxDelta ?? 0) / 0.2, -1, 1),
+    // Inverted so closer earnings -> higher feature value (avoidance signal).
+    // Caps at 30 days out where feature reads 0.
+    days_to_earnings: clamp01((30 - Math.min(30, Math.max(0, ctx.daysToEarnings ?? 30))) / 30),
   };
 }
 

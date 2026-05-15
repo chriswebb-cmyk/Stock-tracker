@@ -203,7 +203,7 @@ export function RedditPanel({ onSelectSymbol }: Props) {
             {posts.map((p) => (
               <li key={p.id} className="px-3 sm:px-4 py-3 hover:bg-slate-900">
                 <a
-                  href={p.permalink ?? p.url ?? '#'}
+                  href={safeHref(p.permalink, p.url)}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="block"
@@ -266,6 +266,15 @@ function sentimentColor(s: number): string {
   if (s > 0.15) return 'text-emerald-400';
   if (s < -0.15) return 'text-rose-400';
   return 'text-slate-400';
+}
+
+// Reddit feeds the URL/permalink fields verbatim; a malicious post could
+// inject 'javascript:...' there. Only allow http(s) URLs to land in href.
+function safeHref(...candidates: (string | null | undefined)[]): string {
+  for (const c of candidates) {
+    if (typeof c === 'string' && /^https?:\/\//i.test(c)) return c;
+  }
+  return '#';
 }
 
 function relativeTime(unixSeconds: number): string {
