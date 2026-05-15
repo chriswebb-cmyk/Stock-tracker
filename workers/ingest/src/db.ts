@@ -142,6 +142,39 @@ export async function loadModels(db: D1Database): Promise<Map<string, {
   return out;
 }
 
+export async function loadMetaModelRow(db: D1Database): Promise<{
+  weightsJson: string;
+  trainedAt: number;
+  sampleCount: number;
+  trainAccuracy: number;
+  valAccuracy: number;
+  trainBaseline: number;
+} | null> {
+  const row = await db
+    .prepare(
+      `SELECT weights_json, trained_at, sample_count,
+              train_accuracy, val_accuracy, train_baseline
+         FROM meta_model WHERE id = 1`,
+    )
+    .first<{
+      weights_json: string;
+      trained_at: number;
+      sample_count: number;
+      train_accuracy: number;
+      val_accuracy: number;
+      train_baseline: number;
+    }>();
+  if (!row) return null;
+  return {
+    weightsJson: row.weights_json,
+    trainedAt: row.trained_at,
+    sampleCount: row.sample_count,
+    trainAccuracy: row.train_accuracy,
+    valAccuracy: row.val_accuracy,
+    trainBaseline: row.train_baseline,
+  };
+}
+
 export async function recentSignalCooldown(
   db: D1Database,
   sinceTs: number,

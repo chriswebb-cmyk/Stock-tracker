@@ -4,6 +4,7 @@ import {
   batchInsertSignals,
   finishIngestRun,
   listEnabledTickers,
+  loadMetaModelRow,
   loadModels,
   recentSignalCooldown,
   startIngestRun,
@@ -14,6 +15,7 @@ import { isUsRegularHours } from '../../../shared/indicators';
 import { postDiscordSignals, type DiscordSignal } from './discord';
 import { modelFromJson, predict, type Model } from '../../../shared/ml';
 import { featuresToVector, type SignalContext } from '../../../shared/features';
+import { buildMetaVector } from '../../../shared/meta';
 import type { Bar } from '../../../shared/types';
 import type { SetupName } from '../../../shared/setups';
 
@@ -152,6 +154,19 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
     });
     if (m) models.set(setup as SetupName, m);
   }
+  // Optional meta-ensemble: if a meta_model row exists, we stack it on top
+  // of the per-setup probabilities to compute the final Discord-gating
+  // probability. Falls back to the per-setup probability when meta isn't
+  // trained yet.
+  const metaRow = await loadMetaModelRow(env.DB);
+  const metaModel = metaRow
+    ? modelFromJson('__meta__' as SetupName, metaRow.weightsJson, metaRow.trainedAt, {
+        sampleCount: metaRow.sampleCount,
+        trainAccuracy: metaRow.trainAccuracy,
+        valAccuracy: metaRow.valAccuracy,
+        trainBaseline: metaRow.trainBaseline,
+      })
+    : null;
   const cooldownLookup = await recentSignalCooldown(
     env.DB,
     Math.floor(now.getTime() / 1000) - cooldownSec,
@@ -275,7 +290,17 @@ async function runIngest(env: Env, now: Date, opts: RunOptions = {}): Promise<{
       let mlProbability: number | null = null;
       const model = models.get(sig.setup);
       if (model) {
-        mlProbability = predict(model, featuresToVector(sig.features));
+        const baseVec = featuresToVector(sig.features);
+        const setupProb = predict(model, baseVec);
+        if (metaModel) {
+          // Stack per-setup prob through the meta model. The meta model has
+          // seen all setups together at training time, so it can express
+          // patterns like "RSI overbought reversal in low-vol regime
+          // matters less than the per-setup model thinks."
+          mlProbability = predict(metaModel, buildMetaVector(setupProb, sig.setup, sig.direction, baseVec));
+        } else {
+          mlProbability = setupProb;
+        }
       }
 
       signalsToInsert.push({

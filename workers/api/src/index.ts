@@ -8,9 +8,10 @@ import type {
   RedditTrending,
 } from '../../../shared/types';
 import { backtest, combineResults, type BacktestResult, type SetupStats } from '../../../shared/backtest';
-import { trainLogReg, modelToJson, type ModelStats } from '../../../shared/ml';
+import { modelFromJson, predict, trainLogReg, modelToJson, type Model, type ModelStats } from '../../../shared/ml';
 import { FEATURE_NAMES, featuresToVector } from '../../../shared/features';
 import type { SetupName } from '../../../shared/setups';
+import { buildMetaVector } from '../../../shared/meta';
 
 export interface Env {
   DB: D1Database;
@@ -486,6 +487,7 @@ async function trainModels(
   cooldownSec: number,
 ): Promise<{
   perSetup: Array<{ setup: SetupName; samples: number; trainAcc: number; valAcc: number; baseline: number }>;
+  meta: { samples: number; trainAcc: number; valAcc: number; baseline: number } | null;
   symbols: number;
   trades: number;
 }> {
@@ -493,13 +495,6 @@ async function trainModels(
     .prepare('SELECT symbol FROM tickers WHERE enabled = 1 ORDER BY symbol')
     .all<{ symbol: string }>();
   const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
-
-  const bySetup = new Map<SetupName, { X: number[][]; y: number[] }>();
-  let totalTrades = 0;
-  let symbolsUsed = 0;
-
-  // Fan out bar loading concurrently — serial loading was burning seconds
-  // of wall-clock budget on D1 round-trips with nothing else happening.
   const symbolBars = await Promise.all(
     tickers.results.map(async ({ symbol }) => ({
       symbol,
@@ -507,27 +502,48 @@ async function trainModels(
     })),
   );
 
+  // Single backtest pass: collect every trade plus its base-feature vector
+  // and outcome. We use this twice — first to train the per-setup models,
+  // then to score those same trades for the meta-model training set.
+  interface TradeRow {
+    setup: SetupName;
+    direction: 'long' | 'short';
+    features: number[];
+    won: number; // 0/1
+  }
+  const allTrades: TradeRow[] = [];
+  let symbolsUsed = 0;
   for (const { symbol, bars } of symbolBars) {
     if (bars.length < 30) continue;
     symbolsUsed += 1;
     const result = backtest(symbol, bars, holdMinutes, cooldownSec);
     for (const t of result.trades) {
-      totalTrades += 1;
-      const bucket = bySetup.get(t.setup) ?? { X: [], y: [] };
-      bucket.X.push(featuresToVector(t.features));
-      bucket.y.push(t.pnlPct > 0 ? 1 : 0);
-      bySetup.set(t.setup, bucket);
+      allTrades.push({
+        setup: t.setup,
+        direction: t.direction,
+        features: featuresToVector(t.features),
+        won: t.pnlPct > 0 ? 1 : 0,
+      });
     }
+  }
+
+  const bySetup = new Map<SetupName, { X: number[][]; y: number[] }>();
+  for (const t of allTrades) {
+    const bucket = bySetup.get(t.setup) ?? { X: [], y: [] };
+    bucket.X.push(t.features);
+    bucket.y.push(t.won);
+    bySetup.set(t.setup, bucket);
   }
 
   const trainedAt = Math.floor(Date.now() / 1000);
   const perSetup: Array<{ setup: SetupName; samples: number; trainAcc: number; valAcc: number; baseline: number }> = [];
+  const trainedPerSetupModels = new Map<SetupName, Model>();
 
   for (const [setup, { X, y }] of bySetup) {
     if (X.length < 30) continue;
     const trained = trainLogReg(X, y);
     const stats: ModelStats = trained.stats;
-    const json = modelToJson({
+    const model: Model = {
       setup,
       featureNames: FEATURE_NAMES,
       means: trained.means,
@@ -536,7 +552,11 @@ async function trainModels(
       bias: trained.bias,
       trainedAt,
       stats,
-    });
+      calibA: trained.calibA,
+      calibB: trained.calibB,
+    };
+    trainedPerSetupModels.set(setup, model);
+    const json = modelToJson(model);
     await db
       .prepare(
         `INSERT INTO models(setup, trained_at, sample_count, train_accuracy,
@@ -561,8 +581,64 @@ async function trainModels(
     });
   }
 
+  // Meta-ensemble: score every trade with its (just-trained) per-setup
+  // model, then train one logistic regression that takes that probability
+  // plus context (setup one-hot, direction, base features) and predicts
+  // outcome. Caveat: this isn't truly out-of-fold — the per-setup model
+  // has seen these trades — so the meta valAcc is a touch optimistic.
+  // For a personal tool that's an acceptable trade-off vs. building a
+  // proper k-fold harness.
+  const metaX: number[][] = [];
+  const metaY: number[] = [];
+  for (const t of allTrades) {
+    const model = trainedPerSetupModels.get(t.setup);
+    if (!model) continue;
+    const setupProb = predict(model, t.features);
+    metaX.push(buildMetaVector(setupProb, t.setup, t.direction, t.features));
+    metaY.push(t.won);
+  }
+
+  let meta: { samples: number; trainAcc: number; valAcc: number; baseline: number } | null = null;
+  if (metaX.length >= 50) {
+    const trained = trainLogReg(metaX, metaY);
+    const stats = trained.stats;
+    const json = modelToJson({
+      setup: '__meta__' as SetupName,
+      featureNames: FEATURE_NAMES,
+      means: trained.means,
+      stds: trained.stds,
+      weights: trained.weights,
+      bias: trained.bias,
+      trainedAt,
+      stats,
+      calibA: trained.calibA,
+      calibB: trained.calibB,
+    });
+    await db
+      .prepare(
+        `INSERT INTO meta_model(id, trained_at, sample_count, train_accuracy,
+                                val_accuracy, train_baseline, weights_json)
+         VALUES (1, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           trained_at = excluded.trained_at,
+           sample_count = excluded.sample_count,
+           train_accuracy = excluded.train_accuracy,
+           val_accuracy = excluded.val_accuracy,
+           train_baseline = excluded.train_baseline,
+           weights_json = excluded.weights_json`,
+      )
+      .bind(trainedAt, stats.sampleCount, stats.trainAccuracy, stats.valAccuracy, stats.trainBaseline, json)
+      .run();
+    meta = {
+      samples: stats.sampleCount,
+      trainAcc: stats.trainAccuracy,
+      valAcc: stats.valAccuracy,
+      baseline: stats.trainBaseline,
+    };
+  }
+
   perSetup.sort((a, b) => a.setup.localeCompare(b.setup));
-  return { perSetup, symbols: symbolsUsed, trades: totalTrades };
+  return { perSetup, meta, symbols: symbolsUsed, trades: allTrades.length };
 }
 
 async function getModels(db: D1Database): Promise<unknown[]> {

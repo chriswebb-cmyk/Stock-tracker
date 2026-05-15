@@ -111,6 +111,21 @@ CREATE TABLE IF NOT EXISTS models (
   weights_json    TEXT NOT NULL  -- {featureNames, means, stds, weights, bias}
 );
 
+-- Meta (ensemble) model that stacks on top of the per-setup models. Single
+-- row keyed by id=1. Takes per-setup probability + setup one-hot +
+-- direction + base features as input and outputs a unified calibrated
+-- probability. Trained whenever the per-setup retrain runs.
+CREATE TABLE IF NOT EXISTS meta_model (
+  id              INTEGER PRIMARY KEY DEFAULT 1,
+  trained_at      INTEGER NOT NULL,
+  sample_count    INTEGER NOT NULL,
+  train_accuracy  REAL NOT NULL,
+  val_accuracy    REAL NOT NULL,
+  train_baseline  REAL NOT NULL,
+  weights_json    TEXT NOT NULL,
+  CHECK (id = 1)
+);
+
 -- Seed the default watchlist. ^VIX and ^TNX are included so the ingest
 -- worker pulls their bars too; the API worker uses the latest values as
 -- regime features on every signal (calm vs. panic market filter, plus
