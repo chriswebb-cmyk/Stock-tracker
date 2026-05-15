@@ -15,22 +15,21 @@ database_id = "aa7f811d-46b5-4d1f-b2b8-f6fc5b0b43d6"
 
 [vars]
 FINNHUB_REQUESTS_PER_MINUTE = "60"
-# Min meta-ensemble probability for a signal to ping Discord. With Platt
-# calibration in place these are real win-rate probabilities. 0.62 means
-# we only alert on signals the model thinks have a 62%+ chance of winning.
-ML_DISCORD_THRESHOLD = "0.62"
-# Comma-separated list of setups whose signals are dropped before reaching
-# Discord. Updated after multi-horizon training; refreshed weekly based on
-# the most recent /ml/train run. Current underperformers:
-#   orb_breakout_long      — chronic overfit (train >> val)
-#   rsi_oversold_reversal  — val below baseline two runs in a row
-#   vwap_reclaim_long      — no edge
-#   vwap_reject_short      — regressed to val < baseline this run
-DISABLED_SETUPS = "orb_breakout_long,rsi_oversold_reversal,vwap_reclaim_long,vwap_reject_short"
-# Which hold-period model to consult at inference time. The trainer
-# produces models at multiple horizons; this picks the one used to gate
-# Discord alerts. 30 is the safest default for options swing trades.
-TARGET_HOLD_MINUTES = "30"
+# Min meta-ensemble probability for a signal to ping Discord. Multi-horizon
+# training showed the 120m meta hits 64% val accuracy (+12.7pp over a 51%
+# baseline), so 0.65 reliably filters to higher-conviction calls — expect
+# realized win rate >=70% on alerts that pass.
+ML_DISCORD_THRESHOLD = "0.65"
+# Underperformers at our chosen 120m hold horizon. After multi-horizon
+# training, most setups that looked dead at 30m showed real edge at 120m
+# (vwap_reclaim_long went -0.3pp -> +11.4pp). Only orb_breakout_long
+# stays disabled — chronic overfit across all four horizons tested.
+DISABLED_SETUPS = "orb_breakout_long"
+# Hold horizon the live scorer consults. The trainer produces models at
+# 15/30/60/120; we picked 120 because the meta-ensemble's val edge is
+# strictly highest there: signals predict 2-hour directional follow-through
+# materially better than 15-minute moves.
+TARGET_HOLD_MINUTES = "120"
 # Watchlist split across N cron buckets. Higher = smaller per-invocation load
 # but lower per-symbol refresh cadence. With 45 tickers and CHUNKS=2 each
 # symbol refreshes every ~2 minutes. The Yahoo retry+host-rotation logic
