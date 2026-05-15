@@ -21,10 +21,11 @@ ML_DISCORD_THRESHOLD = "0.60"
 # the majority-class baseline.
 DISABLED_SETUPS = "vwap_reclaim_long,bb_squeeze_release_short"
 # Watchlist split across N cron buckets. Higher = smaller per-invocation load
-# but lower per-symbol refresh cadence. With 45 tickers and CHUNKS=4 each
-# symbol refreshes every ~4 minutes; keeps wall-clock under the 30s cron
-# limit even when Yahoo throttles and the Finnhub fallback runs serially.
-CHUNKS = "4"
+# but lower per-symbol refresh cadence. With 45 tickers and CHUNKS=2 each
+# symbol refreshes every ~2 minutes. The Yahoo retry+host-rotation logic
+# combined with Finnhub fallback keeps wall-clock under the 30s cron limit
+# at this density.
+CHUNKS = "2"
 
 # Secrets are set with `wrangler secret put FINNHUB_API_KEY` — never in
 # this file.

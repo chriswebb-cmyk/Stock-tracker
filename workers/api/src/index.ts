@@ -74,7 +74,9 @@ async function route(url: URL, request: Request, env: Env): Promise<unknown> {
       throw new HttpError(400, `invalid interval; must be one of ${VALID_INTERVALS.join(', ')}`);
     }
     const limit = clampInt(url.searchParams.get('limit'), 1, 5000, 500);
-    return getBars(env.DB, symbol, interval, limit);
+    return interval === '1min'
+      ? getBars(env.DB, symbol, '1min', limit)
+      : getAggregatedBars(env.DB, symbol, interval, limit);
   }
 
   // /options/:symbol?expiration=YYYY-MM-DD
@@ -247,6 +249,58 @@ async function getBars(
     .all<Bar>();
   // Return ascending so charts render left-to-right by time.
   return results.reverse();
+}
+
+const INTERVAL_SECONDS: Record<BarInterval, number> = {
+  '1min': 60,
+  '5min': 300,
+  '15min': 900,
+  '30min': 1800,
+  '60min': 3600,
+};
+
+// Roll the stored 1min bars up into the requested interval. Cheaper than
+// storing every interval separately (the ingest worker only writes 1min)
+// and instant — D1 read + in-memory aggregation, no extra fetches.
+async function getAggregatedBars(
+  db: D1Database,
+  symbol: string,
+  interval: BarInterval,
+  limit: number,
+): Promise<Bar[]> {
+  const bucketSec = INTERVAL_SECONDS[interval];
+  // Pull enough 1min bars to fill `limit` aggregated bars, capped at 5000
+  // for safety. e.g. limit=500 5min bars -> need 2500 1min bars.
+  const oneMinLimit = Math.min(5000, limit * (bucketSec / 60));
+  const ones = await getBars(db, symbol, '1min', oneMinLimit);
+  if (ones.length === 0) return [];
+
+  // ones is ascending; bucket by floor(ts/bucketSec) and fold OHLC.
+  const buckets = new Map<number, Bar>();
+  for (const b of ones) {
+    const bucketTs = Math.floor(b.ts / bucketSec) * bucketSec;
+    const existing = buckets.get(bucketTs);
+    if (!existing) {
+      buckets.set(bucketTs, {
+        symbol: b.symbol,
+        interval,
+        ts: bucketTs,
+        open: b.open,
+        high: b.high,
+        low: b.low,
+        close: b.close,
+        volume: b.volume,
+      });
+    } else {
+      existing.high = Math.max(existing.high, b.high);
+      existing.low = Math.min(existing.low, b.low);
+      existing.close = b.close; // last close wins (ones is sorted ascending)
+      existing.volume += b.volume;
+    }
+  }
+  return Array.from(buckets.values())
+    .sort((a, b) => a.ts - b.ts)
+    .slice(-limit);
 }
 
 async function getLatestOptions(
