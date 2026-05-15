@@ -15,11 +15,16 @@ database_id = "aa7f811d-46b5-4d1f-b2b8-f6fc5b0b43d6"
 
 [vars]
 FINNHUB_REQUESTS_PER_MINUTE = "60"
-ML_DISCORD_THRESHOLD = "0.60"
+# Min ML probability for a signal to ping Discord. Bumped from 0.60 -> 0.65
+# now that Platt calibration is in place — these are real win-rate
+# probabilities, so fewer-but-higher-conviction alerts.
+ML_DISCORD_THRESHOLD = "0.65"
 # Comma-separated list of setups whose signals are dropped before reaching
-# Discord. Defaults to the two setups whose backtested ML score didn't beat
-# the majority-class baseline.
-DISABLED_SETUPS = "vwap_reclaim_long,bb_squeeze_release_short"
+# Discord. Based on the most recent /ml/train run:
+#   orb_breakout_long      — train 72% / val 36%, severely overfit
+#   rsi_oversold_reversal  — val 58% but baseline 60%, worse than majority
+#   vwap_reclaim_long      — val ≈ baseline, no edge
+DISABLED_SETUPS = "orb_breakout_long,rsi_oversold_reversal,vwap_reclaim_long"
 # Watchlist split across N cron buckets. Higher = smaller per-invocation load
 # but lower per-symbol refresh cadence. With 45 tickers and CHUNKS=2 each
 # symbol refreshes every ~2 minutes. The Yahoo retry+host-rotation logic
