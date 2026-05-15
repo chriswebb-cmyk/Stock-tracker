@@ -165,6 +165,8 @@ export function OptionsPanel({ tickers }: Props) {
                 <th className="text-right px-2 py-1.5">Bid</th>
                 <th className="text-right px-2 py-1.5">Ask</th>
                 <th className="text-right px-2 py-1.5 hidden sm:table-cell">Last</th>
+                <th className="text-right px-2 py-1.5 hidden sm:table-cell">High</th>
+                <th className="text-right px-2 py-1.5 hidden sm:table-cell">Low</th>
                 <th className="text-right px-2 py-1.5">Vol</th>
                 <th className="text-right px-2 py-1.5 hidden sm:table-cell">OI</th>
                 <th className="text-right px-2 py-1.5">IV</th>
@@ -177,7 +179,7 @@ export function OptionsPanel({ tickers }: Props) {
             <tbody>
               {contracts.length === 0 && (
                 <tr>
-                  <td colSpan={11} className="px-3 py-6 text-center text-slate-500 text-sm">
+                  <td colSpan={13} className="px-3 py-6 text-center text-slate-500 text-sm">
                     No contracts on this side.
                   </td>
                 </tr>
@@ -256,6 +258,8 @@ function OptionRow({ c, atm }: { c: OptionContract; atm: boolean }) {
       <td className="text-right px-2 py-1 tabular-nums">{fmtMoney(c.bid)}</td>
       <td className="text-right px-2 py-1 tabular-nums">{fmtMoney(c.ask)}</td>
       <td className="text-right px-2 py-1 tabular-nums hidden sm:table-cell">{fmtMoney(c.last)}</td>
+      <td className="text-right px-2 py-1 tabular-nums hidden sm:table-cell">{fmtMoney(c.high)}</td>
+      <td className="text-right px-2 py-1 tabular-nums hidden sm:table-cell">{fmtMoney(c.low)}</td>
       <td className="text-right px-2 py-1 tabular-nums">{fmtInt(c.volume)}</td>
       <td className="text-right px-2 py-1 tabular-nums hidden sm:table-cell">{fmtInt(c.openInterest)}</td>
       <td className="text-right px-2 py-1 tabular-nums">{fmtPct(c.impliedVolatility)}</td>

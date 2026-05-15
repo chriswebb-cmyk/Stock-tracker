@@ -68,6 +68,8 @@ export interface OptionContract {
   bid: number | null;
   ask: number | null;
   last: number | null;
+  high: number | null;
+  low: number | null;
   volume: number | null;
   openInterest: number | null;
   impliedVolatility: number | null;

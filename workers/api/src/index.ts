@@ -1026,6 +1026,8 @@ interface OptionContract {
   bid: number | null;
   ask: number | null;
   last: number | null;
+  high: number | null;
+  low: number | null;
   volume: number | null;
   openInterest: number | null;
   impliedVolatility: number | null;
@@ -1336,6 +1338,8 @@ interface CboeContractRaw {
   theta?: number;
   vega?: number;
   last_trade_price?: number;
+  high?: number;
+  low?: number;
 }
 
 // Parse an OCC option symbol like "AAPL250117C00100000" into its parts.
@@ -1420,6 +1424,8 @@ async function tryCboeChain(
         bid: typeof raw.bid === 'number' ? raw.bid : null,
         ask: typeof raw.ask === 'number' ? raw.ask : null,
         last: typeof raw.last_trade_price === 'number' ? raw.last_trade_price : null,
+        high: typeof raw.high === 'number' && raw.high > 0 ? raw.high : null,
+        low: typeof raw.low === 'number' && raw.low > 0 ? raw.low : null,
         volume: typeof raw.volume === 'number' ? raw.volume : null,
         openInterest: typeof raw.open_interest === 'number' ? raw.open_interest : null,
         impliedVolatility: typeof raw.iv === 'number' ? raw.iv : null,
@@ -1509,6 +1515,8 @@ async function tryFinnhubChain(
       bid: typeof c.bid === 'number' ? c.bid : null,
       ask: typeof c.ask === 'number' ? c.ask : null,
       last: typeof c.lastPrice === 'number' ? c.lastPrice : null,
+      high: null,
+      low: null,
       volume: typeof c.volume === 'number' ? c.volume : null,
       openInterest: typeof c.openInterest === 'number' ? c.openInterest : null,
       impliedVolatility: typeof c.impliedVolatility === 'number' ? c.impliedVolatility : null,
@@ -1570,6 +1578,8 @@ function toContract(
     bid: c.bid ?? null,
     ask: c.ask ?? null,
     last: c.lastPrice ?? null,
+    high: null,
+    low: null,
     volume: c.volume ?? null,
     openInterest: c.openInterest ?? null,
     impliedVolatility: iv,
