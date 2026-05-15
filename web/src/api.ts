@@ -81,6 +81,11 @@ export interface OptionContract {
 export interface OptionsChain {
   symbol: string;
   spot: number;
+  dayHigh: number | null;
+  dayLow: number | null;
+  dayChange: number | null;
+  dayChangePct: number | null;
+  prevClose: number | null;
   expiration: number; // unix seconds
   expirationDate: string; // YYYY-MM-DD
   daysToExpiry: number;

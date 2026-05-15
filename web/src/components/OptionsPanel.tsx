@@ -111,28 +111,20 @@ export function OptionsPanel({ tickers }: Props) {
         </div>
 
         {chain && (
-          <>
-            <div className="flex items-center gap-2">
-              <label className="text-xs uppercase tracking-wider text-slate-500">Expiration</label>
-              <select
-                value={selectedExpiration ?? chain.expiration}
-                onChange={(e) => setSelectedExpiration(Number(e.target.value))}
-                className="bg-slate-900 border border-slate-800 rounded px-2 py-1 text-sm text-slate-100"
-              >
-                {chain.availableExpirations.map((ts) => (
-                  <option key={ts} value={ts}>
-                    {fmtExpiration(ts)}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div className="text-xs text-slate-400">
-              spot <span className="text-slate-100 font-medium">${chain.spot.toFixed(2)}</span>
-              {' · '}
-              <span className="text-slate-100">{chain.daysToExpiry.toFixed(1)}</span> days to exp
-            </div>
-          </>
+          <div className="flex items-center gap-2">
+            <label className="text-xs uppercase tracking-wider text-slate-500">Expiration</label>
+            <select
+              value={selectedExpiration ?? chain.expiration}
+              onChange={(e) => setSelectedExpiration(Number(e.target.value))}
+              className="bg-slate-900 border border-slate-800 rounded px-2 py-1 text-sm text-slate-100"
+            >
+              {chain.availableExpirations.map((ts) => (
+                <option key={ts} value={ts}>
+                  {fmtExpiration(ts)}
+                </option>
+              ))}
+            </select>
+          </div>
         )}
 
         <div className="ml-auto flex gap-1">
@@ -162,10 +154,12 @@ export function OptionsPanel({ tickers }: Props) {
       {error && <div className="text-rose-400 text-xs">{error}</div>}
       {loading && !chain && <div className="text-slate-500 text-sm">Loading…</div>}
 
+      {chain && <PriceBanner chain={chain} />}
+
       {chain && (
-        <div className="overflow-x-auto border border-slate-800 rounded">
+        <div className="overflow-auto border border-slate-800 rounded max-h-[calc(100vh-280px)]">
           <table className="w-full text-sm">
-            <thead className="text-xs uppercase tracking-wider text-slate-500 bg-slate-950 sticky top-0">
+            <thead className="text-xs uppercase tracking-wider text-slate-300 bg-slate-950 sticky top-0 z-10 shadow-[0_1px_0_0_rgb(30,41,59)]">
               <tr>
                 <th className="text-right px-2 py-1.5">Strike</th>
                 <th className="text-right px-2 py-1.5">Bid</th>
@@ -205,6 +199,46 @@ export function OptionsPanel({ tickers }: Props) {
         Greeks are exchange-published when available, otherwise computed via Black-Scholes
         using the latest 10-year Treasury yield as the risk-free rate (zero dividend
         assumption). ATM row highlighted; ITM strikes shown in the side's color.
+      </div>
+    </div>
+  );
+}
+
+function PriceBanner({ chain }: { chain: OptionsChain }) {
+  const change = chain.dayChange;
+  const changePct = chain.dayChangePct;
+  const positive = change !== null && change >= 0;
+  const changeColor =
+    change === null ? 'text-slate-400' : positive ? 'text-emerald-400' : 'text-rose-400';
+  return (
+    <div className="flex flex-wrap items-baseline gap-x-5 gap-y-1 border border-slate-800 bg-slate-900/40 rounded px-3 py-2">
+      <div className="text-2xl font-semibold tabular-nums text-slate-100">
+        {chain.symbol} ${chain.spot.toFixed(2)}
+      </div>
+      {change !== null && (
+        <div className={'text-sm font-medium tabular-nums ' + changeColor}>
+          {positive ? '+' : ''}
+          {change.toFixed(2)}
+          {changePct !== null && (
+            <span className="ml-1">
+              ({positive ? '+' : ''}
+              {(changePct * 100).toFixed(2)}%)
+            </span>
+          )}
+        </div>
+      )}
+      <div className="text-xs text-slate-400">
+        High <span className="text-slate-100 tabular-nums">{chain.dayHigh !== null ? '$' + chain.dayHigh.toFixed(2) : '—'}</span>
+        {' · '}
+        Low <span className="text-slate-100 tabular-nums">{chain.dayLow !== null ? '$' + chain.dayLow.toFixed(2) : '—'}</span>
+        {chain.prevClose !== null && (
+          <>
+            {' · '}
+            Prev close <span className="text-slate-100 tabular-nums">${chain.prevClose.toFixed(2)}</span>
+          </>
+        )}
+        {' · '}
+        <span className="text-slate-100 tabular-nums">{chain.daysToExpiry.toFixed(1)}</span> days to exp
       </div>
     </div>
   );

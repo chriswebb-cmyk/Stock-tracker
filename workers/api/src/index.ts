@@ -1039,6 +1039,11 @@ interface OptionContract {
 interface OptionsChainResponse {
   symbol: string;
   spot: number;
+  dayHigh: number | null;
+  dayLow: number | null;
+  dayChange: number | null;
+  dayChangePct: number | null;
+  prevClose: number | null;
   expiration: number; // unix seconds
   expirationDate: string; // YYYY-MM-DD
   daysToExpiry: number;
@@ -1139,6 +1144,11 @@ async function getOptionsChain(
     response = {
       symbol,
       spot,
+      dayHigh: null,
+      dayLow: null,
+      dayChange: null,
+      dayChangePct: null,
+      prevClose: null,
       expiration,
       expirationDate,
       daysToExpiry: Math.round(daysToExpiry * 10) / 10,
@@ -1147,6 +1157,13 @@ async function getOptionsChain(
       puts,
     };
   }
+
+  // Overlay day stats from our own bars table — provider quotes for the
+  // underlying are inconsistent (CBOE sometimes nulls them, Yahoo's spot
+  // doesn't include H/L). We poll the symbol on a 1-min cadence so the
+  // bars-derived numbers are accurate to the minute.
+  const dayStats = await getDayStats(env, symbol);
+  response = { ...response, ...dayStats };
 
   try {
     await env.DB
@@ -1160,6 +1177,86 @@ async function getOptionsChain(
     // Cache write is best-effort.
   }
   return response;
+}
+
+// Compute today's high/low/change for a symbol from our 1min bars. Returns
+// nulls when we don't have enough data (new symbol, weekend, etc.).
+async function getDayStats(env: Env, symbol: string): Promise<{
+  dayHigh: number | null;
+  dayLow: number | null;
+  dayChange: number | null;
+  dayChangePct: number | null;
+  prevClose: number | null;
+}> {
+  try {
+    // Most recent bar's ET date defines "today" — robust on weekends and
+    // pre/after-market.
+    const latest = await env.DB
+      .prepare(`SELECT ts FROM bars WHERE symbol=? AND interval='1min' ORDER BY ts DESC LIMIT 1`)
+      .bind(symbol)
+      .first<{ ts: number }>();
+    if (!latest) return { dayHigh: null, dayLow: null, dayChange: null, dayChangePct: null, prevClose: null };
+
+    // ET midnight before the latest bar (DST-aware: use the latest bar's
+    // own offset by re-deriving from the date string).
+    const latestEt = new Date((latest.ts - 5 * 3600) * 1000); // rough; refined below
+    const offsetH = isUsDst(latestEt) ? 4 : 5;
+    const latestEtCorrect = new Date((latest.ts - offsetH * 3600) * 1000);
+    const y = latestEtCorrect.getUTCFullYear();
+    const m = latestEtCorrect.getUTCMonth();
+    const d = latestEtCorrect.getUTCDate();
+    const dayStartUtcMs = Date.UTC(y, m, d, offsetH); // 00:00 ET in UTC
+    const dayStartTs = Math.floor(dayStartUtcMs / 1000);
+
+    const today = await env.DB
+      .prepare(
+        `SELECT MAX(high) AS hi, MIN(low) AS lo, close FROM bars
+         WHERE symbol=? AND interval='1min' AND ts >= ?`,
+      )
+      .bind(symbol, dayStartTs)
+      .first<{ hi: number | null; lo: number | null; close: number | null }>();
+
+    const prev = await env.DB
+      .prepare(
+        `SELECT close FROM bars
+         WHERE symbol=? AND interval='1min' AND ts < ?
+         ORDER BY ts DESC LIMIT 1`,
+      )
+      .bind(symbol, dayStartTs)
+      .first<{ close: number | null }>();
+
+    const dayHigh = today?.hi ?? null;
+    const dayLow = today?.lo ?? null;
+    const prevClose = prev?.close ?? null;
+    const lastClose = today?.close ?? null;
+    const dayChange = lastClose !== null && prevClose !== null ? lastClose - prevClose : null;
+    const dayChangePct = dayChange !== null && prevClose && prevClose > 0
+      ? dayChange / prevClose
+      : null;
+    return { dayHigh, dayLow, dayChange, dayChangePct, prevClose };
+  } catch {
+    return { dayHigh: null, dayLow: null, dayChange: null, dayChangePct: null, prevClose: null };
+  }
+}
+
+// US DST: second Sunday of March through first Sunday of November.
+function isUsDst(date: Date): boolean {
+  const y = date.getUTCFullYear();
+  const marchSecondSun = (() => {
+    const d = new Date(Date.UTC(y, 2, 1));
+    const dow = d.getUTCDay();
+    const firstSun = dow === 0 ? 1 : 8 - dow;
+    return firstSun + 7;
+  })();
+  const novFirstSun = (() => {
+    const d = new Date(Date.UTC(y, 10, 1));
+    const dow = d.getUTCDay();
+    return dow === 0 ? 1 : 8 - dow;
+  })();
+  const start = Date.UTC(y, 2, marchSecondSun, 7); // 2am ET = 7am UTC (EST)
+  const end = Date.UTC(y, 10, novFirstSun, 6); // 2am ET = 6am UTC (EDT)
+  const t = date.getTime();
+  return t >= start && t < end;
 }
 
 interface YahooOptionsResponse {
@@ -1359,6 +1456,11 @@ async function tryCboeChain(
     return {
       symbol,
       spot,
+      dayHigh: null,
+      dayLow: null,
+      dayChange: null,
+      dayChangePct: null,
+      prevClose: null,
       expiration: picked.unix,
       expirationDate: pickedDate,
       daysToExpiry: Math.round(daysToExpiry * 10) / 10,
@@ -1434,6 +1536,11 @@ async function tryFinnhubChain(
     return {
       symbol,
       spot,
+      dayHigh: null,
+      dayLow: null,
+      dayChange: null,
+      dayChangePct: null,
+      prevClose: null,
       expiration: expirationUnix,
       expirationDate,
       daysToExpiry: Math.round(daysToExpiry * 10) / 10,
