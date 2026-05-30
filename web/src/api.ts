@@ -96,6 +96,19 @@ export interface OptionsChain {
   puts: OptionContract[];
 }
 
+export interface KronosForecast {
+  symbol: string;
+  generated_at: number;
+  horizon_days: number;
+  current_close: number;
+  forecast_close: number;
+  forecast_high: number | null;
+  forecast_low: number | null;
+  expected_return_pct: number;
+  sample_count: number;
+  model_name: string;
+}
+
 export interface SignalRow {
   id: number;
   symbol: string;
@@ -152,6 +165,7 @@ export const api = {
         ? `/reddit/posts?symbol=${encodeURIComponent(symbol)}&limit=${limit}`
         : `/reddit/posts?limit=${limit}`,
     ),
+  kronosLatest: () => getJson<KronosForecast[]>('/kronos/latest'),
   redditScrape: () =>
     getJson<{ subreddits: string[]; postsSeen: number; postsNew: number; mentions: number; errors: number }>(
       '/reddit/scrape',

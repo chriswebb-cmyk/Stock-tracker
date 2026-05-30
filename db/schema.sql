@@ -184,3 +184,25 @@ CREATE TABLE IF NOT EXISTS reddit_runs (
   errors        INTEGER NOT NULL DEFAULT 0,
   error_text    TEXT
 );
+
+-- Daily-horizon forecasts written by an external Python process running
+-- the Kronos foundation model locally. The intraday pipeline produces
+-- minute-resolution signals; Kronos gives an independent "second opinion"
+-- on the multi-day move. Dashboard cross-references the two — agreement
+-- between intraday-bullish and Kronos-bullish raises conviction; conflict
+-- is a yellow flag.
+CREATE TABLE IF NOT EXISTS kronos_forecasts (
+  symbol               TEXT NOT NULL,
+  generated_at         INTEGER NOT NULL,   -- when the forecast was produced
+  horizon_days         INTEGER NOT NULL,   -- days ahead being forecast
+  current_close        REAL NOT NULL,      -- spot at forecast time
+  forecast_close       REAL NOT NULL,      -- predicted close at horizon
+  forecast_high        REAL,               -- max forecasted close in window
+  forecast_low         REAL,               -- min forecasted close in window
+  expected_return_pct  REAL NOT NULL,      -- (forecast_close-current)/current
+  sample_count         INTEGER NOT NULL,
+  model_name           TEXT NOT NULL,      -- 'Kronos-mini' | 'Kronos-small' | …
+  PRIMARY KEY (symbol, generated_at, horizon_days)
+);
+CREATE INDEX IF NOT EXISTS kronos_symbol_time
+  ON kronos_forecasts(symbol, generated_at DESC);

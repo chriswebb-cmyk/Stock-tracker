@@ -24,6 +24,10 @@ export interface Env {
   // Finnhub API key. Used for company news (/news/:symbol). When unset,
   // /news returns 503; the dashboard handles that gracefully.
   FINNHUB_API_KEY?: string;
+  // Shared bearer for the local Python Kronos process that POSTs forecasts.
+  // Without this set, /kronos/forecast returns 503 — read-only /kronos/latest
+  // still works.
+  KRONOS_API_KEY?: string;
 }
 
 const VALID_INTERVALS: BarInterval[] = ['1min', '5min', '15min', '30min', '60min'];
@@ -182,6 +186,21 @@ async function route(url: URL, request: Request, env: Env): Promise<unknown> {
     const symbol = optionsMatch2[1]!.toUpperCase();
     const expiration = url.searchParams.get('expiration');
     return getOptionsChain(env, symbol, expiration ? Number(expiration) : null);
+  }
+
+  // Most recent Kronos forecast per symbol (one row per symbol, latest
+  // generated_at). Used by the Kronos dashboard tab.
+  const kronosLatestMatch = path === '/kronos/latest' && request.method === 'GET';
+  if (kronosLatestMatch) {
+    return getKronosLatest(env);
+  }
+
+  // Local Python worker posts a batch of forecasts here. Bearer-auth via
+  // KRONOS_API_KEY. Body: { model: string, generated_at?: number,
+  // forecasts: Array<KronosForecastInput> }.
+  const kronosPostMatch = path === '/kronos/forecast' && request.method === 'POST';
+  if (kronosPostMatch) {
+    return postKronosForecasts(env, request);
   }
 
   // Triggers an on-demand scrape on the reddit worker via the service
@@ -1632,4 +1651,111 @@ function normalCdf(x: number): number {
 
 function normalPdf(x: number): number {
   return Math.exp(-(x * x) / 2) / Math.sqrt(2 * Math.PI);
+}
+
+interface KronosForecastInput {
+  symbol: string;
+  horizon_days: number;
+  current_close: number;
+  forecast_close: number;
+  forecast_high?: number | null;
+  forecast_low?: number | null;
+  sample_count: number;
+}
+
+interface KronosForecastRow {
+  symbol: string;
+  generated_at: number;
+  horizon_days: number;
+  current_close: number;
+  forecast_close: number;
+  forecast_high: number | null;
+  forecast_low: number | null;
+  expected_return_pct: number;
+  sample_count: number;
+  model_name: string;
+}
+
+async function getKronosLatest(env: Env): Promise<KronosForecastRow[]> {
+  // For each symbol, return the row with the largest generated_at.
+  const rows = await env.DB
+    .prepare(
+      `SELECT k.* FROM kronos_forecasts k
+       JOIN (
+         SELECT symbol, MAX(generated_at) AS mx
+         FROM kronos_forecasts
+         GROUP BY symbol
+       ) latest ON latest.symbol = k.symbol AND latest.mx = k.generated_at
+       ORDER BY k.symbol`,
+    )
+    .all<KronosForecastRow>();
+  return rows.results ?? [];
+}
+
+async function postKronosForecasts(env: Env, request: Request): Promise<{ ok: true; written: number; generated_at: number }> {
+  if (!env.KRONOS_API_KEY) {
+    throw new HttpError(503, 'KRONOS_API_KEY not configured on api worker');
+  }
+  const auth = request.headers.get('Authorization') ?? '';
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (!bearer || bearer !== env.KRONOS_API_KEY) {
+    throw new HttpError(401, 'invalid bearer token');
+  }
+
+  let body: { model?: string; generated_at?: number; forecasts?: KronosForecastInput[] };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    throw new HttpError(400, 'body must be JSON');
+  }
+  const model = (body.model ?? '').trim();
+  if (!model) throw new HttpError(400, 'model required');
+  const generatedAt = Number.isFinite(body.generated_at)
+    ? Math.floor(Number(body.generated_at))
+    : Math.floor(Date.now() / 1000);
+  const forecasts = Array.isArray(body.forecasts) ? body.forecasts : [];
+  if (forecasts.length === 0) throw new HttpError(400, 'no forecasts');
+
+  // Validate every row before any write so a partial batch can't poison
+  // the table. D1 batch() commits all-or-nothing.
+  const stmts: D1PreparedStatement[] = [];
+  for (const f of forecasts) {
+    if (!f.symbol || typeof f.symbol !== 'string') throw new HttpError(400, 'symbol required');
+    if (!Number.isFinite(f.horizon_days) || f.horizon_days <= 0) throw new HttpError(400, 'horizon_days required');
+    if (!Number.isFinite(f.current_close) || f.current_close <= 0) throw new HttpError(400, `bad current_close for ${f.symbol}`);
+    if (!Number.isFinite(f.forecast_close) || f.forecast_close <= 0) throw new HttpError(400, `bad forecast_close for ${f.symbol}`);
+    const expectedReturnPct = (f.forecast_close - f.current_close) / f.current_close;
+    stmts.push(
+      env.DB
+        .prepare(
+          `INSERT INTO kronos_forecasts(
+             symbol, generated_at, horizon_days,
+             current_close, forecast_close, forecast_high, forecast_low,
+             expected_return_pct, sample_count, model_name
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(symbol, generated_at, horizon_days) DO UPDATE SET
+             current_close = excluded.current_close,
+             forecast_close = excluded.forecast_close,
+             forecast_high = excluded.forecast_high,
+             forecast_low = excluded.forecast_low,
+             expected_return_pct = excluded.expected_return_pct,
+             sample_count = excluded.sample_count,
+             model_name = excluded.model_name`,
+        )
+        .bind(
+          f.symbol.toUpperCase(),
+          generatedAt,
+          Math.floor(f.horizon_days),
+          f.current_close,
+          f.forecast_close,
+          Number.isFinite(f.forecast_high) ? f.forecast_high : null,
+          Number.isFinite(f.forecast_low) ? f.forecast_low : null,
+          expectedReturnPct,
+          Math.max(1, Math.floor(f.sample_count ?? 1)),
+          model,
+        ),
+    );
+  }
+  await env.DB.batch(stmts);
+  return { ok: true, written: stmts.length, generated_at: generatedAt };
 }
