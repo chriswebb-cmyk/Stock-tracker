@@ -27,6 +27,8 @@ import yfinance as yf
 
 def load_env() -> dict[str, str]:
     """Tiny .env loader (avoids depending on python-dotenv)."""
+    import re
+
     env: dict[str, str] = {}
     env_file = Path(__file__).parent / ".env"
     if env_file.exists():
@@ -35,7 +37,14 @@ def load_env() -> dict[str, str]:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
-            env[k.strip()] = v.strip()
+            # Strip inline comments (' #' or '\t#'). Leaves URL fragments
+            # like https://example.com#frag alone since there's no
+            # whitespace before the '#'.
+            v = re.split(r"\s+#", v, maxsplit=1)[0].strip()
+            # Strip surrounding quotes if present.
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                v = v[1:-1]
+            env[k.strip()] = v
     # Process env wins over .env.
     env.update({k: v for k, v in os.environ.items() if k in env or k.startswith("KRONOS_") or k == "STOCK_TRACKER_API"})
     return env
