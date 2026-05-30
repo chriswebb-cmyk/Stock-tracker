@@ -40,17 +40,36 @@ npx wrangler d1 execute stock-tracker --remote --file=../../db/schema.sql
 ```sh
 cd tools/kronos_forecast
 source .venv/bin/activate
-python forecast.py
+./.venv/bin/python forecast.py
 ```
 
 The first run downloads model weights (~50 MB for mini, ~200 MB for small)
-from Hugging Face. Subsequent runs are fast. Expect:
+from Hugging Face. Subsequent runs are fast.
 
-- **Kronos-mini** on M1 8 GB: ~5–10 s per symbol, peak RAM ~1 GB.
-- **Kronos-small**: ~15–30 s per symbol, peak RAM ~2 GB.
+Each forecast pulls N independent paths (`KRONOS_SAMPLE_COUNT`, default 5)
+so the dashboard can show real P10/P90 confidence bands. With N=5 expect:
 
-For ~25 symbols that's 2–4 minutes (mini) or 6–12 minutes (small). Run it
-once a day before the market opens.
+- **Kronos-mini** on M1 8 GB: ~10–30 s per symbol, peak RAM ~1 GB.
+- **Kronos-small**: ~30–60 s per symbol, peak RAM ~2 GB.
+
+For ~25 symbols that's 4–12 minutes (mini) or 12–25 minutes (small). Run
+it once a day before the market opens.
+
+### Backtest
+
+`backtest.py` walks back through the last year's worth of trading days,
+runs Kronos at each historical date, and scores the prediction against
+what actually happened. Posts hit-rate and MAE per symbol; the dashboard
+joins it onto each forecast row. Slow — plan for 30–90 min on mini.
+
+```sh
+./.venv/bin/python backtest.py                        # last 60 windows, 5d step
+./.venv/bin/python backtest.py --windows 30 --step 7  # quicker
+./.venv/bin/python backtest.py --symbols AAPL,NVDA    # subset for testing
+```
+
+Re-run when you change the model size or horizon. The numbers stay valid
+otherwise — old hit rates inform new forecasts.
 
 ## Automating (optional)
 

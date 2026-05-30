@@ -190,29 +190,52 @@ def main() -> int:
             )
         )
 
-        try:
-            pred = predictor.predict(
-                df=df.reset_index(drop=True),
-                x_timestamp=x_timestamp,
-                y_timestamp=y_timestamp,
-                pred_len=cfg.pred_len,
-                T=cfg.temperature,
-                top_p=cfg.top_p,
-                sample_count=cfg.sample_count,
-            )
-        except Exception as e:
-            print(f"  ! {sym}: predict() failed: {e}", file=sys.stderr)
+        # Generate N independent forecast paths so we can report real
+        # percentiles, not just a mean. Kronos's sample_count averages
+        # internally, which hides the distribution — calling predict N
+        # times with sample_count=1 keeps each path so we can read
+        # P10/P50/P90 from the resulting array.
+        final_closes: list[float] = []
+        max_highs: list[float] = []
+        min_lows: list[float] = []
+        for _ in range(cfg.sample_count):
+            try:
+                pred = predictor.predict(
+                    df=df.reset_index(drop=True),
+                    x_timestamp=x_timestamp,
+                    y_timestamp=y_timestamp,
+                    pred_len=cfg.pred_len,
+                    T=cfg.temperature,
+                    top_p=cfg.top_p,
+                    sample_count=1,
+                )
+            except Exception as e:
+                print(f"  ! {sym}: predict() failed: {e}", file=sys.stderr)
+                final_closes = []
+                break
+            final_closes.append(float(pred["close"].iloc[-1]))
+            if "high" in pred:
+                max_highs.append(float(pred["high"].max()))
+            if "low" in pred:
+                min_lows.append(float(pred["low"].min()))
+        if not final_closes:
             continue
 
+        arr = np.array(final_closes)
         current_close = float(df["close"].iloc[-1])
-        forecast_close = float(pred["close"].iloc[-1])
-        forecast_high = float(pred["high"].max()) if "high" in pred else None
-        forecast_low = float(pred["low"].min()) if "low" in pred else None
+        forecast_close = float(np.median(arr))
+        forecast_p10 = float(np.percentile(arr, 10))
+        forecast_p90 = float(np.percentile(arr, 90))
+        forecast_high = float(np.mean(max_highs)) if max_highs else None
+        forecast_low = float(np.mean(min_lows)) if min_lows else None
         ret = (forecast_close - current_close) / current_close
+        p10_ret = (forecast_p10 - current_close) / current_close
+        p90_ret = (forecast_p90 - current_close) / current_close
         sign = "+" if ret >= 0 else ""
         print(
             f"  {sym:>6}: ${current_close:>8.2f} → ${forecast_close:>8.2f} "
-            f"({sign}{ret * 100:.2f}%)"
+            f"({sign}{ret * 100:>+5.2f}%, band {p10_ret * 100:>+5.2f}%/"
+            f"{p90_ret * 100:>+5.2f}%)"
         )
         out_rows.append(
             dict(
@@ -222,6 +245,8 @@ def main() -> int:
                 forecast_close=forecast_close,
                 forecast_high=forecast_high,
                 forecast_low=forecast_low,
+                forecast_p10=forecast_p10,
+                forecast_p90=forecast_p90,
                 sample_count=cfg.sample_count,
             )
         )

@@ -203,6 +203,17 @@ async function route(url: URL, request: Request, env: Env): Promise<unknown> {
     return postKronosForecasts(env, request);
   }
 
+  // All persisted backtest stats. Read-only; the dashboard's Kronos tab
+  // uses /kronos/latest which already joins these in.
+  if (path === '/kronos/backtest' && request.method === 'GET') {
+    return getKronosBacktest(env);
+  }
+
+  // Local Python posts a batch of backtest results here. Bearer-auth.
+  if (path === '/kronos/backtest' && request.method === 'POST') {
+    return postKronosBacktest(env, request);
+  }
+
   // Triggers an on-demand scrape on the reddit worker via the service
   // binding. The reddit worker doesn't ship CORS headers, so the dashboard
   // hits this proxy instead.
@@ -1660,6 +1671,8 @@ interface KronosForecastInput {
   forecast_close: number;
   forecast_high?: number | null;
   forecast_low?: number | null;
+  forecast_p10?: number | null;
+  forecast_p90?: number | null;
   sample_count: number;
 }
 
@@ -1671,24 +1684,73 @@ interface KronosForecastRow {
   forecast_close: number;
   forecast_high: number | null;
   forecast_low: number | null;
+  forecast_p10: number | null;
+  forecast_p90: number | null;
   expected_return_pct: number;
   sample_count: number;
   model_name: string;
 }
 
-async function getKronosLatest(env: Env): Promise<KronosForecastRow[]> {
-  // For each symbol, return the row with the largest generated_at.
+interface KronosBacktestInput {
+  symbol: string;
+  horizon_days: number;
+  n_runs: number;
+  hit_rate: number;
+  mae_pct: number;
+  signed_err_pct: number;
+  long_only_return_pct?: number | null;
+  buy_hold_return_pct?: number | null;
+}
+
+interface KronosBacktestRow {
+  symbol: string;
+  horizon_days: number;
+  computed_at: number;
+  n_runs: number;
+  hit_rate: number;
+  mae_pct: number;
+  signed_err_pct: number;
+  long_only_return_pct: number | null;
+  buy_hold_return_pct: number | null;
+  model_name: string;
+}
+
+async function getKronosLatest(env: Env): Promise<(KronosForecastRow & {
+  hit_rate: number | null;
+  mae_pct: number | null;
+  n_runs: number | null;
+})[]> {
+  // For each symbol, return the latest forecast joined with the matching
+  // backtest row (if any). LEFT JOIN so symbols without a backtest still
+  // surface their forecast.
   const rows = await env.DB
     .prepare(
-      `SELECT k.* FROM kronos_forecasts k
+      `SELECT k.*,
+              b.hit_rate AS hit_rate,
+              b.mae_pct AS mae_pct,
+              b.n_runs AS n_runs
+       FROM kronos_forecasts k
        JOIN (
          SELECT symbol, MAX(generated_at) AS mx
          FROM kronos_forecasts
          GROUP BY symbol
        ) latest ON latest.symbol = k.symbol AND latest.mx = k.generated_at
+       LEFT JOIN kronos_backtest b
+         ON b.symbol = k.symbol AND b.horizon_days = k.horizon_days
        ORDER BY k.symbol`,
     )
-    .all<KronosForecastRow>();
+    .all<KronosForecastRow & {
+      hit_rate: number | null;
+      mae_pct: number | null;
+      n_runs: number | null;
+    }>();
+  return rows.results ?? [];
+}
+
+async function getKronosBacktest(env: Env): Promise<KronosBacktestRow[]> {
+  const rows = await env.DB
+    .prepare(`SELECT * FROM kronos_backtest ORDER BY symbol, horizon_days`)
+    .all<KronosBacktestRow>();
   return rows.results ?? [];
 }
 
@@ -1731,13 +1793,16 @@ async function postKronosForecasts(env: Env, request: Request): Promise<{ ok: tr
           `INSERT INTO kronos_forecasts(
              symbol, generated_at, horizon_days,
              current_close, forecast_close, forecast_high, forecast_low,
+             forecast_p10, forecast_p90,
              expected_return_pct, sample_count, model_name
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(symbol, generated_at, horizon_days) DO UPDATE SET
              current_close = excluded.current_close,
              forecast_close = excluded.forecast_close,
              forecast_high = excluded.forecast_high,
              forecast_low = excluded.forecast_low,
+             forecast_p10 = excluded.forecast_p10,
+             forecast_p90 = excluded.forecast_p90,
              expected_return_pct = excluded.expected_return_pct,
              sample_count = excluded.sample_count,
              model_name = excluded.model_name`,
@@ -1750,6 +1815,8 @@ async function postKronosForecasts(env: Env, request: Request): Promise<{ ok: tr
           f.forecast_close,
           Number.isFinite(f.forecast_high) ? f.forecast_high : null,
           Number.isFinite(f.forecast_low) ? f.forecast_low : null,
+          Number.isFinite(f.forecast_p10) ? f.forecast_p10 : null,
+          Number.isFinite(f.forecast_p90) ? f.forecast_p90 : null,
           expectedReturnPct,
           Math.max(1, Math.floor(f.sample_count ?? 1)),
           model,
@@ -1758,4 +1825,72 @@ async function postKronosForecasts(env: Env, request: Request): Promise<{ ok: tr
   }
   await env.DB.batch(stmts);
   return { ok: true, written: stmts.length, generated_at: generatedAt };
+}
+
+async function postKronosBacktest(env: Env, request: Request): Promise<{ ok: true; written: number; computed_at: number }> {
+  if (!env.KRONOS_API_KEY) {
+    throw new HttpError(503, 'KRONOS_API_KEY not configured on api worker');
+  }
+  const auth = request.headers.get('Authorization') ?? '';
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (!bearer || bearer !== env.KRONOS_API_KEY) {
+    throw new HttpError(401, 'invalid bearer token');
+  }
+
+  let body: { model?: string; computed_at?: number; results?: KronosBacktestInput[] };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    throw new HttpError(400, 'body must be JSON');
+  }
+  const model = (body.model ?? '').trim();
+  if (!model) throw new HttpError(400, 'model required');
+  const computedAt = Number.isFinite(body.computed_at)
+    ? Math.floor(Number(body.computed_at))
+    : Math.floor(Date.now() / 1000);
+  const results = Array.isArray(body.results) ? body.results : [];
+  if (results.length === 0) throw new HttpError(400, 'no results');
+
+  const stmts: D1PreparedStatement[] = [];
+  for (const r of results) {
+    if (!r.symbol || typeof r.symbol !== 'string') throw new HttpError(400, 'symbol required');
+    if (!Number.isFinite(r.horizon_days) || r.horizon_days <= 0) throw new HttpError(400, 'horizon_days required');
+    if (!Number.isFinite(r.n_runs) || r.n_runs < 0) throw new HttpError(400, `bad n_runs for ${r.symbol}`);
+    if (!Number.isFinite(r.hit_rate)) throw new HttpError(400, `bad hit_rate for ${r.symbol}`);
+    if (!Number.isFinite(r.mae_pct)) throw new HttpError(400, `bad mae_pct for ${r.symbol}`);
+    if (!Number.isFinite(r.signed_err_pct)) throw new HttpError(400, `bad signed_err_pct for ${r.symbol}`);
+    stmts.push(
+      env.DB
+        .prepare(
+          `INSERT INTO kronos_backtest(
+             symbol, horizon_days, computed_at, n_runs,
+             hit_rate, mae_pct, signed_err_pct,
+             long_only_return_pct, buy_hold_return_pct, model_name
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(symbol, horizon_days) DO UPDATE SET
+             computed_at = excluded.computed_at,
+             n_runs = excluded.n_runs,
+             hit_rate = excluded.hit_rate,
+             mae_pct = excluded.mae_pct,
+             signed_err_pct = excluded.signed_err_pct,
+             long_only_return_pct = excluded.long_only_return_pct,
+             buy_hold_return_pct = excluded.buy_hold_return_pct,
+             model_name = excluded.model_name`,
+        )
+        .bind(
+          r.symbol.toUpperCase(),
+          Math.floor(r.horizon_days),
+          computedAt,
+          Math.floor(r.n_runs),
+          r.hit_rate,
+          r.mae_pct,
+          r.signed_err_pct,
+          Number.isFinite(r.long_only_return_pct) ? r.long_only_return_pct : null,
+          Number.isFinite(r.buy_hold_return_pct) ? r.buy_hold_return_pct : null,
+          model,
+        ),
+    );
+  }
+  await env.DB.batch(stmts);
+  return { ok: true, written: stmts.length, computed_at: computedAt };
 }

@@ -104,9 +104,15 @@ export interface KronosForecast {
   forecast_close: number;
   forecast_high: number | null;
   forecast_low: number | null;
+  forecast_p10: number | null;
+  forecast_p90: number | null;
   expected_return_pct: number;
   sample_count: number;
   model_name: string;
+  // Joined from kronos_backtest if a backtest has been run.
+  hit_rate: number | null;
+  mae_pct: number | null;
+  n_runs: number | null;
 }
 
 export interface SignalRow {

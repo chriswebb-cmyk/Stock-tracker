@@ -196,9 +196,11 @@ CREATE TABLE IF NOT EXISTS kronos_forecasts (
   generated_at         INTEGER NOT NULL,   -- when the forecast was produced
   horizon_days         INTEGER NOT NULL,   -- days ahead being forecast
   current_close        REAL NOT NULL,      -- spot at forecast time
-  forecast_close       REAL NOT NULL,      -- predicted close at horizon
+  forecast_close       REAL NOT NULL,      -- median forecast at horizon
   forecast_high        REAL,               -- max forecasted close in window
   forecast_low         REAL,               -- min forecasted close in window
+  forecast_p10         REAL,               -- 10th percentile at horizon
+  forecast_p90         REAL,               -- 90th percentile at horizon
   expected_return_pct  REAL NOT NULL,      -- (forecast_close-current)/current
   sample_count         INTEGER NOT NULL,
   model_name           TEXT NOT NULL,      -- 'Kronos-mini' | 'Kronos-small' | …
@@ -206,3 +208,22 @@ CREATE TABLE IF NOT EXISTS kronos_forecasts (
 );
 CREATE INDEX IF NOT EXISTS kronos_symbol_time
   ON kronos_forecasts(symbol, generated_at DESC);
+
+-- Walk-forward backtest stats for Kronos on each symbol. One row per
+-- (symbol, horizon_days). Re-running the backtest overwrites. Used by the
+-- dashboard to qualify each forecast — a 3% prediction means a lot more
+-- on a symbol where Kronos hits ~60% direction historically than on one
+-- where it's coin-flip.
+CREATE TABLE IF NOT EXISTS kronos_backtest (
+  symbol               TEXT NOT NULL,
+  horizon_days         INTEGER NOT NULL,
+  computed_at          INTEGER NOT NULL,
+  n_runs               INTEGER NOT NULL,   -- # of historical predictions scored
+  hit_rate             REAL NOT NULL,      -- fraction where forecast sign matched
+  mae_pct              REAL NOT NULL,      -- mean abs error on return, in pct
+  signed_err_pct       REAL NOT NULL,      -- mean signed error (bias)
+  long_only_return_pct REAL,               -- cumulative return of 'follow forecast when bullish'
+  buy_hold_return_pct  REAL,               -- buy-and-hold baseline over same window
+  model_name           TEXT NOT NULL,
+  PRIMARY KEY (symbol, horizon_days)
+);
