@@ -214,6 +214,22 @@ async function route(url: URL, request: Request, env: Env): Promise<unknown> {
     return postKronosBacktest(env, request);
   }
 
+  // Chronos endpoints mirror the Kronos shape. The dashboard fetches both
+  // and ensembles client-side. Auth shares KRONOS_API_KEY since both
+  // models are run by the same local Python harness on the user's Mac.
+  if (path === '/chronos/latest' && request.method === 'GET') {
+    return getChronosLatest(env);
+  }
+  if (path === '/chronos/forecast' && request.method === 'POST') {
+    return postChronosForecasts(env, request);
+  }
+  if (path === '/chronos/backtest' && request.method === 'GET') {
+    return getChronosBacktest(env);
+  }
+  if (path === '/chronos/backtest' && request.method === 'POST') {
+    return postChronosBacktest(env, request);
+  }
+
   // Triggers an on-demand scrape on the reddit worker via the service
   // binding. The reddit worker doesn't ship CORS headers, so the dashboard
   // hits this proxy instead.
@@ -1894,3 +1910,217 @@ async function postKronosBacktest(env: Env, request: Request): Promise<{ ok: tru
   await env.DB.batch(stmts);
   return { ok: true, written: stmts.length, computed_at: computedAt };
 }
+
+interface ChronosForecastInput {
+  symbol: string;
+  horizon_days: number;
+  current_close: number;
+  forecast_close: number;
+  forecast_p10?: number | null;
+  forecast_p90?: number | null;
+  sample_count: number;
+}
+
+interface ChronosForecastRow {
+  symbol: string;
+  generated_at: number;
+  horizon_days: number;
+  current_close: number;
+  forecast_close: number;
+  forecast_p10: number | null;
+  forecast_p90: number | null;
+  expected_return_pct: number;
+  sample_count: number;
+  model_name: string;
+}
+
+interface ChronosBacktestInput {
+  symbol: string;
+  horizon_days: number;
+  n_runs: number;
+  hit_rate: number;
+  mae_pct: number;
+  signed_err_pct: number;
+  long_only_return_pct?: number | null;
+  buy_hold_return_pct?: number | null;
+}
+
+interface ChronosBacktestRow {
+  symbol: string;
+  horizon_days: number;
+  computed_at: number;
+  n_runs: number;
+  hit_rate: number;
+  mae_pct: number;
+  signed_err_pct: number;
+  long_only_return_pct: number | null;
+  buy_hold_return_pct: number | null;
+  model_name: string;
+}
+
+async function getChronosLatest(env: Env): Promise<(ChronosForecastRow & {
+  hit_rate: number | null;
+  mae_pct: number | null;
+  n_runs: number | null;
+})[]> {
+  const rows = await env.DB
+    .prepare(
+      `SELECT c.*,
+              b.hit_rate AS hit_rate,
+              b.mae_pct AS mae_pct,
+              b.n_runs AS n_runs
+       FROM chronos_forecasts c
+       JOIN (
+         SELECT symbol, MAX(generated_at) AS mx
+         FROM chronos_forecasts
+         GROUP BY symbol
+       ) latest ON latest.symbol = c.symbol AND latest.mx = c.generated_at
+       LEFT JOIN chronos_backtest b
+         ON b.symbol = c.symbol AND b.horizon_days = c.horizon_days
+       ORDER BY c.symbol`,
+    )
+    .all<ChronosForecastRow & {
+      hit_rate: number | null;
+      mae_pct: number | null;
+      n_runs: number | null;
+    }>();
+  return rows.results ?? [];
+}
+
+async function getChronosBacktest(env: Env): Promise<ChronosBacktestRow[]> {
+  const rows = await env.DB
+    .prepare(`SELECT * FROM chronos_backtest ORDER BY symbol, horizon_days`)
+    .all<ChronosBacktestRow>();
+  return rows.results ?? [];
+}
+
+async function postChronosForecasts(env: Env, request: Request): Promise<{ ok: true; written: number; generated_at: number }> {
+  if (!env.KRONOS_API_KEY) {
+    throw new HttpError(503, 'KRONOS_API_KEY not configured on api worker');
+  }
+  const auth = request.headers.get('Authorization') ?? '';
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (!bearer || bearer !== env.KRONOS_API_KEY) {
+    throw new HttpError(401, 'invalid bearer token');
+  }
+
+  let body: { model?: string; generated_at?: number; forecasts?: ChronosForecastInput[] };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    throw new HttpError(400, 'body must be JSON');
+  }
+  const model = (body.model ?? '').trim();
+  if (!model) throw new HttpError(400, 'model required');
+  const generatedAt = Number.isFinite(body.generated_at)
+    ? Math.floor(Number(body.generated_at))
+    : Math.floor(Date.now() / 1000);
+  const forecasts = Array.isArray(body.forecasts) ? body.forecasts : [];
+  if (forecasts.length === 0) throw new HttpError(400, 'no forecasts');
+
+  const stmts: D1PreparedStatement[] = [];
+  for (const f of forecasts) {
+    if (!f.symbol || typeof f.symbol !== 'string') throw new HttpError(400, 'symbol required');
+    if (!Number.isFinite(f.horizon_days) || f.horizon_days <= 0) throw new HttpError(400, 'horizon_days required');
+    if (!Number.isFinite(f.current_close) || f.current_close <= 0) throw new HttpError(400, `bad current_close for ${f.symbol}`);
+    if (!Number.isFinite(f.forecast_close) || f.forecast_close <= 0) throw new HttpError(400, `bad forecast_close for ${f.symbol}`);
+    const expectedReturnPct = (f.forecast_close - f.current_close) / f.current_close;
+    stmts.push(
+      env.DB
+        .prepare(
+          `INSERT INTO chronos_forecasts(
+             symbol, generated_at, horizon_days,
+             current_close, forecast_close, forecast_p10, forecast_p90,
+             expected_return_pct, sample_count, model_name
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(symbol, generated_at, horizon_days) DO UPDATE SET
+             current_close = excluded.current_close,
+             forecast_close = excluded.forecast_close,
+             forecast_p10 = excluded.forecast_p10,
+             forecast_p90 = excluded.forecast_p90,
+             expected_return_pct = excluded.expected_return_pct,
+             sample_count = excluded.sample_count,
+             model_name = excluded.model_name`,
+        )
+        .bind(
+          f.symbol.toUpperCase(),
+          generatedAt,
+          Math.floor(f.horizon_days),
+          f.current_close,
+          f.forecast_close,
+          Number.isFinite(f.forecast_p10) ? f.forecast_p10 : null,
+          Number.isFinite(f.forecast_p90) ? f.forecast_p90 : null,
+          expectedReturnPct,
+          Math.max(1, Math.floor(f.sample_count ?? 1)),
+          model,
+        ),
+    );
+  }
+  await env.DB.batch(stmts);
+  return { ok: true, written: stmts.length, generated_at: generatedAt };
+}
+
+async function postChronosBacktest(env: Env, request: Request): Promise<{ ok: true; written: number; computed_at: number }> {
+  if (!env.KRONOS_API_KEY) {
+    throw new HttpError(503, 'KRONOS_API_KEY not configured on api worker');
+  }
+  const auth = request.headers.get('Authorization') ?? '';
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (!bearer || bearer !== env.KRONOS_API_KEY) {
+    throw new HttpError(401, 'invalid bearer token');
+  }
+
+  let body: { model?: string; computed_at?: number; results?: ChronosBacktestInput[] };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    throw new HttpError(400, 'body must be JSON');
+  }
+  const model = (body.model ?? '').trim();
+  if (!model) throw new HttpError(400, 'model required');
+  const computedAt = Number.isFinite(body.computed_at)
+    ? Math.floor(Number(body.computed_at))
+    : Math.floor(Date.now() / 1000);
+  const results = Array.isArray(body.results) ? body.results : [];
+  if (results.length === 0) throw new HttpError(400, 'no results');
+
+  const stmts: D1PreparedStatement[] = [];
+  for (const r of results) {
+    if (!r.symbol || typeof r.symbol !== 'string') throw new HttpError(400, 'symbol required');
+    if (!Number.isFinite(r.horizon_days) || r.horizon_days <= 0) throw new HttpError(400, 'horizon_days required');
+    stmts.push(
+      env.DB
+        .prepare(
+          `INSERT INTO chronos_backtest(
+             symbol, horizon_days, computed_at, n_runs,
+             hit_rate, mae_pct, signed_err_pct,
+             long_only_return_pct, buy_hold_return_pct, model_name
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(symbol, horizon_days) DO UPDATE SET
+             computed_at = excluded.computed_at,
+             n_runs = excluded.n_runs,
+             hit_rate = excluded.hit_rate,
+             mae_pct = excluded.mae_pct,
+             signed_err_pct = excluded.signed_err_pct,
+             long_only_return_pct = excluded.long_only_return_pct,
+             buy_hold_return_pct = excluded.buy_hold_return_pct,
+             model_name = excluded.model_name`,
+        )
+        .bind(
+          r.symbol.toUpperCase(),
+          Math.floor(r.horizon_days),
+          computedAt,
+          Math.floor(r.n_runs),
+          r.hit_rate,
+          r.mae_pct,
+          r.signed_err_pct,
+          Number.isFinite(r.long_only_return_pct) ? r.long_only_return_pct : null,
+          Number.isFinite(r.buy_hold_return_pct) ? r.buy_hold_return_pct : null,
+          model,
+        ),
+    );
+  }
+  await env.DB.batch(stmts);
+  return { ok: true, written: stmts.length, computed_at: computedAt };
+}
+

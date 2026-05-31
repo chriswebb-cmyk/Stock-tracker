@@ -172,6 +172,7 @@ export const api = {
         : `/reddit/posts?limit=${limit}`,
     ),
   kronosLatest: () => getJson<KronosForecast[]>('/kronos/latest'),
+  chronosLatest: () => getJson<KronosForecast[]>('/chronos/latest'),
   redditScrape: () =>
     getJson<{ subreddits: string[]; postsSeen: number; postsNew: number; mentions: number; errors: number }>(
       '/reddit/scrape',

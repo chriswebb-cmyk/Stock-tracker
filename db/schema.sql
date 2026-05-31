@@ -227,3 +227,37 @@ CREATE TABLE IF NOT EXISTS kronos_backtest (
   model_name           TEXT NOT NULL,
   PRIMARY KEY (symbol, horizon_days)
 );
+
+-- Second daily-horizon foundation model: Amazon's Chronos. Parallel to
+-- kronos_forecasts so the dashboard can show both side-by-side. When the
+-- two models agree on direction the signal is strongest; when they
+-- disagree it's a yellow flag worth investigating.
+CREATE TABLE IF NOT EXISTS chronos_forecasts (
+  symbol               TEXT NOT NULL,
+  generated_at         INTEGER NOT NULL,
+  horizon_days         INTEGER NOT NULL,
+  current_close        REAL NOT NULL,
+  forecast_close       REAL NOT NULL,      -- median forecast at horizon
+  forecast_p10         REAL,
+  forecast_p90         REAL,
+  expected_return_pct  REAL NOT NULL,
+  sample_count         INTEGER NOT NULL,
+  model_name           TEXT NOT NULL,      -- 'chronos-bolt-tiny' | …
+  PRIMARY KEY (symbol, generated_at, horizon_days)
+);
+CREATE INDEX IF NOT EXISTS chronos_symbol_time
+  ON chronos_forecasts(symbol, generated_at DESC);
+
+CREATE TABLE IF NOT EXISTS chronos_backtest (
+  symbol               TEXT NOT NULL,
+  horizon_days         INTEGER NOT NULL,
+  computed_at          INTEGER NOT NULL,
+  n_runs               INTEGER NOT NULL,
+  hit_rate             REAL NOT NULL,
+  mae_pct              REAL NOT NULL,
+  signed_err_pct       REAL NOT NULL,
+  long_only_return_pct REAL,
+  buy_hold_return_pct  REAL,
+  model_name           TEXT NOT NULL,
+  PRIMARY KEY (symbol, horizon_days)
+);
