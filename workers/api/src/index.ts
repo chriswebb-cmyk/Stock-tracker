@@ -596,7 +596,7 @@ async function getBacktestSummary(
   days: number,
   holdMinutes: number,
   cooldownSec: number,
-): Promise<{ symbols: number; trades: number; bySetup: SetupStats[] }> {
+): Promise<{ symbols: number; trades: number; bySetup: SetupStats[]; bySymbol: Array<{ symbol: string; trades: number; bySetup: SetupStats[] }> }> {
   const tickers = await db
     .prepare('SELECT symbol FROM tickers WHERE enabled = 1 ORDER BY symbol')
     .all<{ symbol: string }>();
@@ -617,6 +617,11 @@ async function getBacktestSummary(
     symbols: results.length,
     trades: totalTrades,
     bySetup: combineResults(results),
+    bySymbol: results.map((r) => ({
+      symbol: r.symbol,
+      trades: r.trades.length,
+      bySetup: r.bySetup,
+    })),
   };
 }
 

@@ -24,6 +24,7 @@ export interface BacktestSummary {
   symbols: number;
   trades: number;
   bySetup: SetupStats[];
+  bySymbol?: Array<{ symbol: string; trades: number; bySetup: SetupStats[] }>;
   cachedAt?: number | null;
   stale?: boolean;
 }

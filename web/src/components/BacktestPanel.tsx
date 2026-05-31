@@ -142,8 +142,161 @@ export function BacktestPanel() {
               </tbody>
             </table>
           </div>
+
+          {data.bySymbol && data.bySymbol.length > 0 && (
+            <PerSymbolMatrix bySymbol={data.bySymbol} bySetupTotal={data.bySetup} />
+          )}
         </>
       )}
+    </div>
+  );
+}
+
+interface SetupStatsLite {
+  setup: string;
+  trades: number;
+  winRate: number;
+  avgPnlPct: number;
+  totalPnlPct: number;
+}
+
+interface PerSymbolRow {
+  symbol: string;
+  trades: number;
+  bySetup: SetupStatsLite[];
+}
+
+type SortKey = 'symbol' | 'trades' | 'totalPnlPct';
+
+// Per-symbol breakdown. Heatmap-style matrix: rows = symbols, columns =
+// setups, each cell shows win-rate / trade-count colored by edge. Lets you
+// see at a glance "VWAP reclaim is great on NVDA but garbage on TLT".
+function PerSymbolMatrix({
+  bySymbol,
+  bySetupTotal,
+}: {
+  bySymbol: PerSymbolRow[];
+  bySetupTotal: SetupStatsLite[];
+}) {
+  const [sortKey, setSortKey] = useState<SortKey>('totalPnlPct');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+
+  // Column order matches the aggregate table: setups that actually fired
+  // in this window, in the order the aggregate displays them.
+  const setupCols = bySetupTotal.filter((s) => s.trades > 0).map((s) => s.setup);
+
+  // For each row, compute totals across all setups so we can sort by it.
+  const enriched = bySymbol.map((r) => {
+    const totalPnl = r.bySetup.reduce((acc, s) => acc + s.totalPnlPct, 0);
+    return { ...r, totalPnlPct: totalPnl };
+  });
+
+  const sorted = [...enriched].sort((a, b) => {
+    const mul = sortDir === 'asc' ? 1 : -1;
+    if (sortKey === 'symbol') return a.symbol.localeCompare(b.symbol) * mul;
+    if (sortKey === 'trades') return (a.trades - b.trades) * mul;
+    return (a.totalPnlPct - b.totalPnlPct) * mul;
+  });
+
+  function toggleSort(k: SortKey) {
+    if (k === sortKey) setSortDir(sortDir === 'asc' ? 'desc' : 'asc');
+    else {
+      setSortKey(k);
+      setSortDir(k === 'symbol' ? 'asc' : 'desc');
+    }
+  }
+
+  function cellColor(s: SetupStatsLite | undefined): string {
+    if (!s || s.trades === 0) return 'bg-slate-900/40 text-slate-600';
+    const edge = s.avgPnlPct;
+    if (edge >= 0.005) return 'bg-emerald-900/40 text-emerald-200';
+    if (edge >= 0.002) return 'bg-emerald-900/20 text-emerald-300';
+    if (edge <= -0.005) return 'bg-rose-900/40 text-rose-200';
+    if (edge <= -0.002) return 'bg-rose-900/20 text-rose-300';
+    return 'bg-slate-800/40 text-slate-300';
+  }
+
+  return (
+    <div className="space-y-2 pt-2 border-t border-slate-800">
+      <div className="flex items-baseline justify-between">
+        <h3 className="text-sm font-medium text-slate-200">Per-symbol breakdown</h3>
+        <span className="text-xs text-slate-500">
+          cells = avg P&amp;L / trades · click headers to sort
+        </span>
+      </div>
+      <div className="overflow-auto border border-slate-800 rounded max-h-[60vh]">
+        <table className="text-xs">
+          <thead className="text-xs uppercase tracking-wider text-slate-300 bg-slate-950 sticky top-0 z-10 shadow-[0_1px_0_0_rgb(30,41,59)]">
+            <tr>
+              <th
+                onClick={() => toggleSort('symbol')}
+                className="text-left px-2 py-2 cursor-pointer hover:text-white"
+              >
+                Symbol {sortKey === 'symbol' && (sortDir === 'asc' ? '▲' : '▼')}
+              </th>
+              <th
+                onClick={() => toggleSort('trades')}
+                className="text-right px-2 py-2 cursor-pointer hover:text-white"
+              >
+                Trades {sortKey === 'trades' && (sortDir === 'asc' ? '▲' : '▼')}
+              </th>
+              <th
+                onClick={() => toggleSort('totalPnlPct')}
+                className="text-right px-2 py-2 cursor-pointer hover:text-white"
+              >
+                Total P&amp;L {sortKey === 'totalPnlPct' && (sortDir === 'asc' ? '▲' : '▼')}
+              </th>
+              {setupCols.map((setup) => (
+                <th key={setup} className="text-right px-2 py-2 whitespace-nowrap">
+                  {SETUP_LABEL[setup] ?? setup}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map((row) => {
+              const bySetupMap = new Map(row.bySetup.map((s) => [s.setup, s]));
+              return (
+                <tr key={row.symbol} className="border-t border-slate-900">
+                  <td className="px-2 py-1.5 font-medium text-slate-100">{row.symbol}</td>
+                  <td className="text-right px-2 py-1.5 tabular-nums text-slate-400">
+                    {row.trades}
+                  </td>
+                  <td
+                    className={
+                      'text-right px-2 py-1.5 tabular-nums font-medium ' +
+                      (row.totalPnlPct >= 0 ? 'text-emerald-400' : 'text-rose-400')
+                    }
+                  >
+                    {fmtPct(row.totalPnlPct)}
+                  </td>
+                  {setupCols.map((setup) => {
+                    const s = bySetupMap.get(setup);
+                    return (
+                      <td
+                        key={setup}
+                        className={
+                          'text-right px-2 py-1.5 tabular-nums whitespace-nowrap ' +
+                          cellColor(s)
+                        }
+                        title={
+                          s && s.trades > 0
+                            ? `${SETUP_LABEL[setup] ?? setup}\nwin rate: ${(s.winRate * 100).toFixed(1)}%\navg P&L: ${fmtPct(s.avgPnlPct)}\ntotal: ${fmtPct(s.totalPnlPct)}\ntrades: ${s.trades}`
+                            : 'no trades fired'
+                        }
+                      >
+                        {s && s.trades > 0
+                          ? `${fmtPct(s.avgPnlPct)} (${s.trades})`
+                          : '—'}
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
