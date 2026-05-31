@@ -476,7 +476,7 @@ async function refreshCaches(env: Env, cron: string): Promise<void> {
   for (const days of [1, 7] as const) {
     try {
       const summary = await getBacktestSummary(env.DB, days, 30, 1800);
-      await writeCache(env.DB, `backtest-summary-${days}-30-1800`, JSON.stringify(summary));
+      await writeCache(env.DB, `backtest-summary-v2-${days}-30-1800`, JSON.stringify(summary));
     } catch (err) {
       console.error(`backtest cache refresh failed (days=${days})`, err);
     }
@@ -489,8 +489,16 @@ async function getCachedBacktestSummary(
   holdMinutes: number,
   cooldownSec: number,
   refresh: boolean,
-): Promise<{ symbols: number; trades: number; bySetup: SetupStats[]; cachedAt: number | null; stale: boolean }> {
-  const key = `backtest-summary-${days}-${holdMinutes}-${cooldownSec}`;
+): Promise<{
+  symbols: number;
+  trades: number;
+  bySetup: SetupStats[];
+  bySymbol: Array<{ symbol: string; trades: number; bySetup: SetupStats[] }>;
+  cachedAt: number | null;
+  stale: boolean;
+}> {
+  // v2 bump invalidates pre-bySymbol cached payloads.
+  const key = `backtest-summary-v2-${days}-${holdMinutes}-${cooldownSec}`;
   if (!refresh) {
     const row = await db
       .prepare('SELECT value, updated_at FROM json_cache WHERE key = ?')
@@ -498,7 +506,12 @@ async function getCachedBacktestSummary(
       .first<{ value: string; updated_at: number }>();
     if (row) {
       const ageHours = (Math.floor(Date.now() / 1000) - row.updated_at) / 3600;
-      const parsed = JSON.parse(row.value) as { symbols: number; trades: number; bySetup: SetupStats[] };
+      const parsed = JSON.parse(row.value) as {
+        symbols: number;
+        trades: number;
+        bySetup: SetupStats[];
+        bySymbol: Array<{ symbol: string; trades: number; bySetup: SetupStats[] }>;
+      };
       return { ...parsed, cachedAt: row.updated_at, stale: ageHours > 24 };
     }
   }
