@@ -11,10 +11,11 @@ import { RedditPanel } from './components/RedditPanel';
 import { NewsPanel } from './components/NewsPanel';
 import { OptionsPanel } from './components/OptionsPanel';
 import { ForecastsPanel } from './components/ForecastsPanel';
+import { EarningsPanel } from './components/EarningsPanel';
 
 const INTERVALS: BarInterval[] = ['1min', '5min', '15min', '60min'];
 
-type Tab = 'chart' | 'options' | 'backtest' | 'ml' | 'reddit' | 'forecasts';
+type Tab = 'chart' | 'options' | 'backtest' | 'ml' | 'reddit' | 'forecasts' | 'earnings';
 
 export default function App() {
   const [tickers, setTickers] = useState<Ticker[]>([]);
@@ -86,7 +87,7 @@ export default function App() {
       )}
 
       <div className="flex border-b border-slate-800 px-4">
-        {(['chart', 'options', 'backtest', 'ml', 'forecasts', 'reddit'] as Tab[]).map((t) => (
+        {(['chart', 'options', 'earnings', 'backtest', 'ml', 'forecasts', 'reddit'] as Tab[]).map((t) => (
           <button
             key={t}
             type="button"
@@ -110,6 +111,10 @@ export default function App() {
       ) : tab === 'forecasts' ? (
         <div className="flex-1 overflow-y-auto">
           <ForecastsPanel onSelectSymbol={(s) => { setSelected(s); setTab('chart'); }} />
+        </div>
+      ) : tab === 'earnings' ? (
+        <div className="flex-1 overflow-y-auto">
+          <EarningsPanel tickers={tickers} onSelectSymbol={(s) => { setSelected(s); setTab('chart'); }} />
         </div>
       ) : tab === 'reddit' ? (
         <div className="flex-1 min-h-0">

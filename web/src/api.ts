@@ -97,6 +97,18 @@ export interface OptionsChain {
   puts: OptionContract[];
 }
 
+export interface EarningsItem {
+  symbol: string;
+  date: string;       // 'YYYY-MM-DD'
+  hour: string;       // 'bmo' | 'amc' | ''
+  epsEstimate: number | null;
+  epsActual: number | null;
+  revenueEstimate: number | null;
+  revenueActual: number | null;
+  quarter: number;
+  year: number;
+}
+
 export interface KronosForecast {
   symbol: string;
   generated_at: number;
@@ -172,6 +184,7 @@ export const api = {
         ? `/reddit/posts?symbol=${encodeURIComponent(symbol)}&limit=${limit}`
         : `/reddit/posts?limit=${limit}`,
     ),
+  earnings: (days = 7) => getJson<EarningsItem[]>(`/earnings?days=${days}`),
   kronosLatest: () => getJson<KronosForecast[]>('/kronos/latest'),
   chronosLatest: () => getJson<KronosForecast[]>('/chronos/latest'),
   redditScrape: () =>

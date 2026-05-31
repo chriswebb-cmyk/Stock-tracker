@@ -188,6 +188,14 @@ async function route(url: URL, request: Request, env: Env): Promise<unknown> {
     return getOptionsChain(env, symbol, expiration ? Number(expiration) : null);
   }
 
+  // Earnings calendar for the next N days (default 7). Symbols across the
+  // whole US market — the dashboard highlights watchlist ones. Cached for
+  // 30 min in json_cache since the calendar doesn't change minute-to-minute.
+  if (path === '/earnings' && request.method === 'GET') {
+    const days = clampInt(url.searchParams.get('days'), 1, 30, 7);
+    return getEarningsCalendar(env, days);
+  }
+
   // Most recent Kronos forecast per symbol (one row per symbol, latest
   // generated_at). Used by the Kronos dashboard tab.
   const kronosLatestMatch = path === '/kronos/latest' && request.method === 'GET';
@@ -592,6 +600,96 @@ async function getCompanyNews(env: Env, symbol: string, limit: number): Promise<
     // Best-effort cache write.
   }
   return news.slice(0, limit);
+}
+
+interface EarningsItem {
+  symbol: string;
+  date: string;       // 'YYYY-MM-DD'
+  hour: string;       // 'bmo' (before open) | 'amc' (after close) | ''
+  epsEstimate: number | null;
+  epsActual: number | null;
+  revenueEstimate: number | null;
+  revenueActual: number | null;
+  quarter: number;
+  year: number;
+}
+
+interface FinnhubEarningsResponse {
+  earningsCalendar?: Array<{
+    symbol?: string;
+    date?: string;
+    hour?: string;
+    epsEstimate?: number | null;
+    epsActual?: number | null;
+    revenueEstimate?: number | null;
+    revenueActual?: number | null;
+    quarter?: number;
+    year?: number;
+  }>;
+}
+
+async function getEarningsCalendar(env: Env, days: number): Promise<EarningsItem[]> {
+  if (!env.FINNHUB_API_KEY) {
+    throw new HttpError(503, 'FINNHUB_API_KEY not configured on api worker');
+  }
+  const key = `earnings-${days}`;
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    const row = await env.DB
+      .prepare('SELECT value, updated_at FROM json_cache WHERE key = ?')
+      .bind(key)
+      .first<{ value: string; updated_at: number }>();
+    if (row && now - row.updated_at < 1800) {
+      return JSON.parse(row.value) as EarningsItem[];
+    }
+  } catch {
+    // Fall through.
+  }
+
+  const today = new Date();
+  const fromStr = today.toISOString().slice(0, 10);
+  const to = new Date(today.getTime() + days * 86400_000);
+  const toStr = to.toISOString().slice(0, 10);
+  const url =
+    `https://finnhub.io/api/v1/calendar/earnings?from=${fromStr}&to=${toStr}` +
+    `&token=${env.FINNHUB_API_KEY}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) throw new HttpError(res.status, `finnhub earnings ${res.status}`);
+  const json = (await res.json()) as FinnhubEarningsResponse;
+  const raw = json.earningsCalendar ?? [];
+  const items: EarningsItem[] = raw
+    .filter((r) => r.symbol && r.date)
+    .map((r) => ({
+      symbol: r.symbol!.toUpperCase(),
+      date: r.date!,
+      hour: r.hour ?? '',
+      epsEstimate: typeof r.epsEstimate === 'number' ? r.epsEstimate : null,
+      epsActual: typeof r.epsActual === 'number' ? r.epsActual : null,
+      revenueEstimate: typeof r.revenueEstimate === 'number' ? r.revenueEstimate : null,
+      revenueActual: typeof r.revenueActual === 'number' ? r.revenueActual : null,
+      quarter: r.quarter ?? 0,
+      year: r.year ?? 0,
+    }))
+    .sort((a, b) => {
+      if (a.date !== b.date) return a.date.localeCompare(b.date);
+      // 'bmo' before 'amc' before '' so morning calls show up first.
+      const order = (h: string) => (h === 'bmo' ? 0 : h === 'amc' ? 1 : 2);
+      const ho = order(a.hour) - order(b.hour);
+      if (ho !== 0) return ho;
+      return a.symbol.localeCompare(b.symbol);
+    });
+  try {
+    await env.DB
+      .prepare(
+        `INSERT INTO json_cache(key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+      )
+      .bind(key, JSON.stringify(items), now)
+      .run();
+  } catch {
+    // Best-effort.
+  }
+  return items;
 }
 
 async function writeCache(db: D1Database, key: string, value: string): Promise<void> {
