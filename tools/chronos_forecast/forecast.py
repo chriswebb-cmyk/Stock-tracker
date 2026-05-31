@@ -157,23 +157,24 @@ def main() -> int:
         closes = df["close"].astype(float).values
         context = torch.tensor(closes)
         try:
-            # Bolt: returns (quantiles_tensor, mean_tensor). Original
-            # Chronos: returns samples tensor of shape [1, num_samples, pred_len].
+            # Bolt pipeline returns (quantiles_tensor, mean_tensor). Pass
+            # context positionally — the kwarg name is `inputs` on Bolt
+            # and `context` on the original ChronosPipeline, so positional
+            # works on both. Shape: [1, pred_len, 3] for [P10, P50, P90].
             result = pipeline.predict_quantiles(
-                context=context,
+                context,
                 prediction_length=cfg.pred_len,
                 quantile_levels=[0.1, 0.5, 0.9],
             )
             quantiles = result[0] if isinstance(result, tuple) else result
-            # Shape: [1, pred_len, 3] for [P10, P50, P90].
             q = quantiles[0].cpu().numpy()
             p10_final = float(q[-1, 0])
             p50_final = float(q[-1, 1])
             p90_final = float(q[-1, 2])
         except AttributeError:
-            # Fall back to the original Chronos sample API.
+            # Older original Chronos: only .predict() returning samples.
             samples = pipeline.predict(
-                context=context,
+                context,
                 prediction_length=cfg.pred_len,
                 num_samples=cfg.sample_count,
             )
