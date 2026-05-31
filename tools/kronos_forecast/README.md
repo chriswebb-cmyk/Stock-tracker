@@ -35,6 +35,26 @@ npm run deploy
 npx wrangler d1 execute stock-tracker --remote --file=../../db/schema.sql
 ```
 
+## Quick-launch shortcuts (Desktop)
+
+Two double-clickable wrappers ship with the repo so you don't have to
+open a terminal every time:
+
+- `run_forecast.command` — runs `forecast.py` and leaves the Terminal
+  window open so you can read the output.
+- `run_backtest.command` — runs `backtest.py`; accepts the same flags
+  (passes any args through), so e.g. you can make a copy named
+  `backtest_quick.command` whose only difference is calling
+  `./.venv/bin/python backtest.py --symbols AAPL,NVDA --windows 10`.
+
+Drop copies of either file on your Desktop (or anywhere) and
+double-click. macOS may warn the first time about "unidentified
+developer" — right-click → Open and pick Open from the prompt.
+
+The wrappers assume the repo lives at
+`~/Desktop/options trading/Stock-tracker`. If you moved it, edit
+`KRONOS_DIR` near the top of each file.
+
 ## Running
 
 ```sh
