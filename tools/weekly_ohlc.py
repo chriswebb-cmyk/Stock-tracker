@@ -42,6 +42,13 @@ def weekly_last(symbol: str, period: str) -> pd.DataFrame | None:
     df["week"] = df.index.to_period("W-FRI")
     last = df.groupby("week").tail(1)
     out = last[needed].copy()
+    # Body = close - open (positive = green candle). Range = high - low.
+    # Percentages are referenced to the open so they're comparable across
+    # symbols at very different price levels.
+    out["Body $"] = out["Close"] - out["Open"]
+    out["Body %"] = (out["Close"] - out["Open"]) / out["Open"] * 100
+    out["Range $"] = out["High"] - out["Low"]
+    out["Range %"] = (out["High"] - out["Low"]) / out["Open"] * 100
     out.index = out.index.date
     out.index.name = "date"
     return out
