@@ -43,14 +43,33 @@ def weekly_last(symbol: str, period: str) -> pd.DataFrame | None:
     last = df.groupby("week").tail(1)
     out = last[needed].copy()
     # Body = close - open (positive = green candle). Range = high - low.
-    # Percentages are referenced to the open so they're comparable across
-    # symbols at very different price levels.
+    # The percentage columns are stored as raw decimal fractions (e.g.
+    # 0.0042 for 0.42%) so spreadsheet apps applying percentage formatting
+    # render them correctly. The terminal printer formats them as `0.42%`.
     out["Body $"] = out["Close"] - out["Open"]
-    out["Body %"] = (out["Close"] - out["Open"]) / out["Open"] * 100
+    out["Body %"] = (out["Close"] - out["Open"]) / out["Open"]
     out["Range $"] = out["High"] - out["Low"]
-    out["Range %"] = (out["High"] - out["Low"]) / out["Open"] * 100
+    out["Range %"] = (out["High"] - out["Low"]) / out["Open"]
     out.index = out.index.date
     out.index.name = "date"
+    return out
+
+
+def display_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Stringify each column the way a human reads it: $ for prices and
+    body/range, % for the percentage columns. Underlying DataFrame stays
+    numeric so the CSV export is still spreadsheet-friendly.
+    """
+    out = df.copy()
+    for col in out.columns:
+        if col in ("Body %", "Range %"):
+            out[col] = out[col].apply(
+                lambda v: f"{v * 100:>+8.2f}%" if pd.notna(v) else ""
+            )
+        else:
+            out[col] = out[col].apply(
+                lambda v: f"${v:>9.2f}" if pd.notna(v) else ""
+            )
     return out
 
 
@@ -69,9 +88,7 @@ def main() -> int:
             continue
         frames[sym] = df
         print(f"\n=== {sym} ({len(df)} weeks) ===")
-        # Pretty print with 2dp money formatting.
-        with pd.option_context("display.float_format", lambda v: f"{v:>10.2f}"):
-            print(df.to_string())
+        print(display_frame(df).to_string())
 
     if args.csv and frames:
         merged = pd.concat(
