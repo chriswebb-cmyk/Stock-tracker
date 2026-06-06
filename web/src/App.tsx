@@ -1,20 +1,31 @@
 import { useEffect, useState } from 'react';
-import { api } from './api';
+import { api, type SignalRow } from './api';
 import type { Bar, BarInterval, IngestRun, Ticker } from '../../shared/types';
 import { Watchlist } from './components/Watchlist';
 import { PriceChart } from './components/PriceChart';
 import { IndicatorPanel } from './components/IndicatorPanel';
 import { StatusBar } from './components/StatusBar';
+import { BacktestPanel } from './components/BacktestPanel';
+import { MlPanel } from './components/MlPanel';
+import { RedditPanel } from './components/RedditPanel';
+import { NewsPanel } from './components/NewsPanel';
+import { OptionsPanel } from './components/OptionsPanel';
+import { ForecastsPanel } from './components/ForecastsPanel';
+import { EarningsPanel } from './components/EarningsPanel';
 
 const INTERVALS: BarInterval[] = ['1min', '5min', '15min', '60min'];
+
+type Tab = 'chart' | 'options' | 'backtest' | 'ml' | 'reddit' | 'forecasts' | 'earnings';
 
 export default function App() {
   const [tickers, setTickers] = useState<Ticker[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [interval, setInterval_] = useState<BarInterval>('1min');
   const [bars, setBars] = useState<Bar[]>([]);
+  const [signals, setSignals] = useState<SignalRow[]>([]);
   const [latestRun, setLatestRun] = useState<IngestRun | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [tab, setTab] = useState<Tab>('chart');
 
   useEffect(() => {
     api
@@ -28,23 +39,29 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!selected) return;
+    if (!selected || tab !== 'chart') return;
     let cancelled = false;
     const load = async () => {
       try {
-        const data = await api.bars(selected, interval, 500);
-        if (!cancelled) setBars(data);
+        const [data, sigs] = await Promise.all([
+          api.bars(selected, interval, 500),
+          api.signalsForSymbol(selected, 7).catch(() => [] as SignalRow[]),
+        ]);
+        if (!cancelled) {
+          setBars(data);
+          setSignals(sigs);
+        }
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
       }
     };
     load();
-    const id = window.setInterval(load, 30_000); // refresh every 30s
+    const id = window.setInterval(load, 30_000);
     return () => {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [selected, interval]);
+  }, [selected, interval, tab]);
 
   useEffect(() => {
     const load = () => api.ingestRuns(1).then((rs) => setLatestRun(rs[0] ?? null)).catch(() => {});
@@ -55,10 +72,10 @@ export default function App() {
 
   return (
     <div className="h-full flex flex-col">
-      <header className="flex items-center justify-between border-b border-slate-800 px-4 py-2">
+      <header className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 px-3 py-2">
         <div className="flex items-baseline gap-3">
-          <h1 className="text-lg font-semibold tracking-tight">Stock Tracker</h1>
-          <span className="text-xs text-slate-500">ML pattern signals · phase 1</span>
+          <h1 className="text-base sm:text-lg font-semibold tracking-tight">Stock Tracker</h1>
+          <span className="hidden sm:inline text-xs text-slate-500">Phase 2 · indicators + backtest</span>
         </div>
         <StatusBar latest={latestRun} />
       </header>
@@ -69,43 +86,106 @@ export default function App() {
         </div>
       )}
 
-      <div className="flex-1 grid grid-cols-[220px_1fr] min-h-0">
-        <aside className="border-r border-slate-800 overflow-y-auto">
-          <div className="px-4 py-3 text-xs uppercase tracking-wider text-slate-500">
-            Watchlist
-          </div>
-          <Watchlist tickers={tickers} selected={selected} onSelect={setSelected} />
-        </aside>
-
-        <main className="flex flex-col min-h-0">
-          <div className="flex items-center justify-between border-b border-slate-800 px-4 py-2">
-            <div className="text-base font-medium">{selected ?? '—'}</div>
-            <div className="flex gap-1">
-              {INTERVALS.map((iv) => (
-                <button
-                  key={iv}
-                  type="button"
-                  onClick={() => setInterval_(iv)}
-                  className={
-                    'px-2 py-1 text-xs rounded ' +
-                    (iv === interval
-                      ? 'bg-slate-700 text-white'
-                      : 'text-slate-400 hover:bg-slate-800')
-                  }
-                >
-                  {iv}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <IndicatorPanel bars={bars} />
-
-          <div className="flex-1 min-h-0">
-            <PriceChart bars={bars} />
-          </div>
-        </main>
+      <div className="flex border-b border-slate-800 px-4">
+        {(['chart', 'options', 'earnings', 'backtest', 'ml', 'forecasts', 'reddit'] as Tab[]).map((t) => (
+          <button
+            key={t}
+            type="button"
+            onClick={() => setTab(t)}
+            className={
+              'px-3 py-2 text-xs uppercase tracking-wider ' +
+              (tab === t
+                ? 'text-white border-b-2 border-emerald-500'
+                : 'text-slate-500 hover:text-slate-300')
+            }
+          >
+            {t}
+          </button>
+        ))}
       </div>
+
+      {tab === 'ml' ? (
+        <div className="flex-1 overflow-y-auto">
+          <MlPanel />
+        </div>
+      ) : tab === 'forecasts' ? (
+        <div className="flex-1 overflow-y-auto">
+          <ForecastsPanel onSelectSymbol={(s) => { setSelected(s); setTab('chart'); }} />
+        </div>
+      ) : tab === 'earnings' ? (
+        <div className="flex-1 overflow-y-auto">
+          <EarningsPanel tickers={tickers} onSelectSymbol={(s) => { setSelected(s); setTab('chart'); }} />
+        </div>
+      ) : tab === 'reddit' ? (
+        <div className="flex-1 min-h-0">
+          <RedditPanel onSelectSymbol={setSelected} />
+        </div>
+      ) : tab === 'options' ? (
+        <div className="flex-1 overflow-y-auto">
+          <OptionsPanel tickers={tickers} />
+        </div>
+      ) : tab === 'chart' ? (
+        <div className="flex-1 grid grid-cols-1 md:grid-cols-[220px_1fr] min-h-0">
+          <aside className="hidden md:block border-r border-slate-800 overflow-y-auto">
+            <div className="px-4 py-3 text-xs uppercase tracking-wider text-slate-500">
+              Watchlist
+            </div>
+            <Watchlist tickers={tickers} selected={selected} onSelect={setSelected} />
+          </aside>
+
+          <main className="flex flex-col min-h-0">
+            <div className="md:hidden px-4 py-2 border-b border-slate-800">
+              <select
+                value={selected ?? ''}
+                onChange={(e) => setSelected(e.target.value || null)}
+                className="w-full bg-slate-900 border border-slate-800 rounded px-3 py-2 text-base text-slate-100"
+              >
+                {tickers.map((t) => (
+                  <option key={t.symbol} value={t.symbol}>
+                    {t.symbol}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex items-center justify-between border-b border-slate-800 px-4 py-2">
+              <div className="text-base font-medium">{selected ?? '—'}</div>
+              <div className="flex gap-1">
+                {INTERVALS.map((iv) => (
+                  <button
+                    key={iv}
+                    type="button"
+                    onClick={() => setInterval_(iv)}
+                    className={
+                      'px-2 py-1 text-xs rounded ' +
+                      (iv === interval
+                        ? 'bg-slate-700 text-white'
+                        : 'text-slate-400 hover:bg-slate-800')
+                    }
+                  >
+                    {iv}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <IndicatorPanel bars={bars} />
+
+            <div className="flex-1 min-h-0 grid grid-rows-[1fr_auto] md:grid-rows-[1fr_240px]">
+              <div className="min-h-0">
+                <PriceChart bars={bars} signals={signals} />
+              </div>
+              <div className="border-t border-slate-800 min-h-0 max-h-[240px] overflow-hidden">
+                <NewsPanel symbol={selected} />
+              </div>
+            </div>
+          </main>
+        </div>
+      ) : (
+        <div className="flex-1 overflow-y-auto">
+          <BacktestPanel />
+        </div>
+      )}
     </div>
   );
 }

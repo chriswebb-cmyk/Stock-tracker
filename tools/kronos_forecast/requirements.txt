@@ -1,0 +1,10 @@
+# Minimum set to run Kronos inference + post to the worker.
+# PyTorch is pinned for Apple Silicon MPS compatibility.
+torch>=2.2,<3
+transformers>=4.40,<5
+pandas>=2.0
+numpy>=1.24
+requests>=2.31
+yfinance>=0.2.40
+huggingface_hub>=0.20
+einops>=0.7

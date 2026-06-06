@@ -31,7 +31,8 @@ export function StatusBar({ latest }: Props) {
         aria-hidden
       />
       <span className="text-slate-400">
-        Last poll {ago(ts)} · {latest.symbols} symbols · {latest.apiCalls} API calls
+        <span>Last poll {ago(ts)}</span>
+        <span className="hidden sm:inline"> · {latest.symbols} symbols · {latest.apiCalls} API calls</span>
         {latest.errors > 0 && (
           <span className="text-amber-300"> · {latest.errors} errors</span>
         )}

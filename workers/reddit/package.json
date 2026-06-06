@@ -1,11 +1,10 @@
 {
-  "name": "stock-tracker-ingest",
+  "name": "stock-tracker-reddit",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev --persist-to ../../.wrangler/state",
-    "tick": "while true; do curl -s http://localhost:8787/run; echo; sleep 60; done",
+    "dev": "wrangler dev --port 8789",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit"
   },

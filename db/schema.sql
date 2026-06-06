@@ -90,6 +90,174 @@ CREATE TABLE IF NOT EXISTS ingest_runs (
   error_text    TEXT
 );
 
--- Seed the default watchlist.
+-- Generic JSON cache. Used so the backtest summary doesn't have to be
+-- recomputed on every dashboard load (which trips the 10ms free-tier CPU
+-- budget). The weekly retrain cron writes this; /backtest-summary reads it.
+CREATE TABLE IF NOT EXISTS json_cache (
+  key         TEXT PRIMARY KEY,
+  value       TEXT NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+
+-- Per-setup logistic regression model trained on backtest results. One row
+-- per (setup, hold_minutes); retraining replaces the row. Holding multiple
+-- horizons lets the system answer "what's the win probability at 15m vs
+-- 60m hold?" — useful for options trades where premium decay differs.
+DROP TABLE IF EXISTS models;
+CREATE TABLE IF NOT EXISTS models (
+  setup           TEXT NOT NULL,
+  hold_minutes    INTEGER NOT NULL DEFAULT 30,
+  trained_at      INTEGER NOT NULL,
+  sample_count    INTEGER NOT NULL,
+  train_accuracy  REAL NOT NULL,
+  val_accuracy    REAL NOT NULL,
+  train_baseline  REAL NOT NULL,
+  weights_json    TEXT NOT NULL,
+  PRIMARY KEY (setup, hold_minutes)
+);
+
+-- Meta (ensemble) model that stacks on top of the per-setup models. One
+-- row per hold_minutes horizon. Takes per-setup probability + setup
+-- one-hot + direction + base features as input and outputs a unified
+-- calibrated probability for that horizon.
+DROP TABLE IF EXISTS meta_model;
+CREATE TABLE IF NOT EXISTS meta_model (
+  hold_minutes    INTEGER PRIMARY KEY,
+  trained_at      INTEGER NOT NULL,
+  sample_count    INTEGER NOT NULL,
+  train_accuracy  REAL NOT NULL,
+  val_accuracy    REAL NOT NULL,
+  train_baseline  REAL NOT NULL,
+  weights_json    TEXT NOT NULL
+);
+
+-- Seed the default watchlist. ^VIX and ^TNX are included so the ingest
+-- worker pulls their bars too; the API worker uses the latest values as
+-- regime features on every signal (calm vs. panic market filter, plus
+-- yield-driven style rotation).
 INSERT OR IGNORE INTO tickers(symbol) VALUES
-  ('SPY'), ('QQQ'), ('AAPL'), ('NVDA'), ('TSLA');
+  ('SPY'), ('QQQ'), ('AAPL'), ('NVDA'), ('TSLA'), ('^VIX'), ('^TNX');
+
+-- Reddit posts pulled from r/wallstreetbets (and any other subs we add). One
+-- row per Reddit post id ('t3_xxxx'), upserted on each scrape so score and
+-- num_comments stay fresh while the post is hot.
+CREATE TABLE IF NOT EXISTS reddit_posts (
+  id            TEXT PRIMARY KEY,             -- Reddit fullname or id
+  subreddit     TEXT NOT NULL,
+  author        TEXT,
+  title         TEXT NOT NULL,
+  selftext      TEXT,
+  flair         TEXT,
+  score         INTEGER NOT NULL DEFAULT 0,
+  num_comments  INTEGER NOT NULL DEFAULT 0,
+  permalink     TEXT,
+  url           TEXT,
+  created_utc   INTEGER NOT NULL,             -- post creation, unix seconds
+  fetched_at    INTEGER NOT NULL              -- last time we refreshed it
+);
+CREATE INDEX IF NOT EXISTS reddit_posts_created
+  ON reddit_posts(created_utc DESC);
+CREATE INDEX IF NOT EXISTS reddit_posts_sub_created
+  ON reddit_posts(subreddit, created_utc DESC);
+
+-- Ticker mentions extracted from a post's title + selftext. mention_count is
+-- how many times the symbol appears in that single post; sentiment is a
+-- bullish-minus-bearish keyword score in [-1, 1].
+CREATE TABLE IF NOT EXISTS reddit_mentions (
+  post_id        TEXT NOT NULL REFERENCES reddit_posts(id) ON DELETE CASCADE,
+  symbol         TEXT NOT NULL,
+  mention_count  INTEGER NOT NULL DEFAULT 1,
+  sentiment      REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (post_id, symbol)
+);
+CREATE INDEX IF NOT EXISTS reddit_mentions_symbol
+  ON reddit_mentions(symbol);
+
+-- Heartbeat for the reddit scraper, parallel to ingest_runs.
+CREATE TABLE IF NOT EXISTS reddit_runs (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  started_at    INTEGER NOT NULL,
+  finished_at   INTEGER,
+  posts_seen    INTEGER NOT NULL DEFAULT 0,
+  posts_new     INTEGER NOT NULL DEFAULT 0,
+  mentions      INTEGER NOT NULL DEFAULT 0,
+  errors        INTEGER NOT NULL DEFAULT 0,
+  error_text    TEXT
+);
+
+-- Daily-horizon forecasts written by an external Python process running
+-- the Kronos foundation model locally. The intraday pipeline produces
+-- minute-resolution signals; Kronos gives an independent "second opinion"
+-- on the multi-day move. Dashboard cross-references the two — agreement
+-- between intraday-bullish and Kronos-bullish raises conviction; conflict
+-- is a yellow flag.
+CREATE TABLE IF NOT EXISTS kronos_forecasts (
+  symbol               TEXT NOT NULL,
+  generated_at         INTEGER NOT NULL,   -- when the forecast was produced
+  horizon_days         INTEGER NOT NULL,   -- days ahead being forecast
+  current_close        REAL NOT NULL,      -- spot at forecast time
+  forecast_close       REAL NOT NULL,      -- median forecast at horizon
+  forecast_high        REAL,               -- max forecasted close in window
+  forecast_low         REAL,               -- min forecasted close in window
+  forecast_p10         REAL,               -- 10th percentile at horizon
+  forecast_p90         REAL,               -- 90th percentile at horizon
+  expected_return_pct  REAL NOT NULL,      -- (forecast_close-current)/current
+  sample_count         INTEGER NOT NULL,
+  model_name           TEXT NOT NULL,      -- 'Kronos-mini' | 'Kronos-small' | …
+  PRIMARY KEY (symbol, generated_at, horizon_days)
+);
+CREATE INDEX IF NOT EXISTS kronos_symbol_time
+  ON kronos_forecasts(symbol, generated_at DESC);
+
+-- Walk-forward backtest stats for Kronos on each symbol. One row per
+-- (symbol, horizon_days). Re-running the backtest overwrites. Used by the
+-- dashboard to qualify each forecast — a 3% prediction means a lot more
+-- on a symbol where Kronos hits ~60% direction historically than on one
+-- where it's coin-flip.
+CREATE TABLE IF NOT EXISTS kronos_backtest (
+  symbol               TEXT NOT NULL,
+  horizon_days         INTEGER NOT NULL,
+  computed_at          INTEGER NOT NULL,
+  n_runs               INTEGER NOT NULL,   -- # of historical predictions scored
+  hit_rate             REAL NOT NULL,      -- fraction where forecast sign matched
+  mae_pct              REAL NOT NULL,      -- mean abs error on return, in pct
+  signed_err_pct       REAL NOT NULL,      -- mean signed error (bias)
+  long_only_return_pct REAL,               -- cumulative return of 'follow forecast when bullish'
+  buy_hold_return_pct  REAL,               -- buy-and-hold baseline over same window
+  model_name           TEXT NOT NULL,
+  PRIMARY KEY (symbol, horizon_days)
+);
+
+-- Second daily-horizon foundation model: Amazon's Chronos. Parallel to
+-- kronos_forecasts so the dashboard can show both side-by-side. When the
+-- two models agree on direction the signal is strongest; when they
+-- disagree it's a yellow flag worth investigating.
+CREATE TABLE IF NOT EXISTS chronos_forecasts (
+  symbol               TEXT NOT NULL,
+  generated_at         INTEGER NOT NULL,
+  horizon_days         INTEGER NOT NULL,
+  current_close        REAL NOT NULL,
+  forecast_close       REAL NOT NULL,      -- median forecast at horizon
+  forecast_p10         REAL,
+  forecast_p90         REAL,
+  expected_return_pct  REAL NOT NULL,
+  sample_count         INTEGER NOT NULL,
+  model_name           TEXT NOT NULL,      -- 'chronos-bolt-tiny' | …
+  PRIMARY KEY (symbol, generated_at, horizon_days)
+);
+CREATE INDEX IF NOT EXISTS chronos_symbol_time
+  ON chronos_forecasts(symbol, generated_at DESC);
+
+CREATE TABLE IF NOT EXISTS chronos_backtest (
+  symbol               TEXT NOT NULL,
+  horizon_days         INTEGER NOT NULL,
+  computed_at          INTEGER NOT NULL,
+  n_runs               INTEGER NOT NULL,
+  hit_rate             REAL NOT NULL,
+  mae_pct              REAL NOT NULL,
+  signed_err_pct       REAL NOT NULL,
+  long_only_return_pct REAL,
+  buy_hold_return_pct  REAL,
+  model_name           TEXT NOT NULL,
+  PRIMARY KEY (symbol, horizon_days)
+);

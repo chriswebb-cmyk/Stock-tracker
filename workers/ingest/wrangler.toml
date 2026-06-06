@@ -11,11 +11,31 @@ crons = ["* * * * *"]
 binding = "DB"
 database_name = "stock-tracker"
 # Replace with the id printed by `wrangler d1 create stock-tracker`.
-database_id = "REPLACE_WITH_D1_ID"
+database_id = "aa7f811d-46b5-4d1f-b2b8-f6fc5b0b43d6"
 
 [vars]
-POLL_OPTIONS = "false"
-AV_REQUESTS_PER_MINUTE = "75"
+FINNHUB_REQUESTS_PER_MINUTE = "60"
+# Min meta-ensemble probability for a signal to ping Discord. Multi-horizon
+# training showed the 120m meta hits 64% val accuracy (+12.7pp over a 51%
+# baseline), so 0.65 reliably filters to higher-conviction calls — expect
+# realized win rate >=70% on alerts that pass.
+ML_DISCORD_THRESHOLD = "0.65"
+# Underperformers at our chosen 120m hold horizon. After multi-horizon
+# training, most setups that looked dead at 30m showed real edge at 120m
+# (vwap_reclaim_long went -0.3pp -> +11.4pp). Only orb_breakout_long
+# stays disabled — chronic overfit across all four horizons tested.
+DISABLED_SETUPS = "orb_breakout_long"
+# Hold horizon the live scorer consults. The trainer produces models at
+# 15/30/60/120; we picked 120 because the meta-ensemble's val edge is
+# strictly highest there: signals predict 2-hour directional follow-through
+# materially better than 15-minute moves.
+TARGET_HOLD_MINUTES = "120"
+# Watchlist split across N cron buckets. Higher = smaller per-invocation load
+# but lower per-symbol refresh cadence. With 45 tickers and CHUNKS=2 each
+# symbol refreshes every ~2 minutes. The Yahoo retry+host-rotation logic
+# combined with Finnhub fallback keeps wall-clock under the 30s cron limit
+# at this density.
+CHUNKS = "2"
 
-# Secrets are set with `wrangler secret put ALPHAVANTAGE_API_KEY` — never in
+# Secrets are set with `wrangler secret put FINNHUB_API_KEY` — never in
 # this file.

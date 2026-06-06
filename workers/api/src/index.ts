@@ -1,15 +1,42 @@
-import type { Bar, BarInterval, Ticker, IngestRun } from '../../../shared/types';
+import type {
+  Bar,
+  BarInterval,
+  Ticker,
+  IngestRun,
+  RedditDiamond,
+  RedditPost,
+  RedditTrending,
+} from '../../../shared/types';
+import { backtest, combineResults, type BacktestResult, type SetupStats } from '../../../shared/backtest';
+import { modelFromJson, predict, trainLogReg, modelToJson, type Model, type ModelStats } from '../../../shared/ml';
+import { FEATURE_NAMES, featuresToVector } from '../../../shared/features';
+import type { SetupName } from '../../../shared/setups';
+import { buildMetaVector } from '../../../shared/meta';
 
 export interface Env {
   DB: D1Database;
   // Comma-separated list of allowed origins for CORS. Defaults to '*' for
   // dev convenience; set this in production.
   ALLOWED_ORIGINS?: string;
+  // Service binding to the reddit scraper worker (defined in wrangler.toml).
+  // /reddit/scrape proxies to it so the dashboard can trigger a scrape.
+  REDDIT?: Fetcher;
+  // Finnhub API key. Used for company news (/news/:symbol). When unset,
+  // /news returns 503; the dashboard handles that gracefully.
+  FINNHUB_API_KEY?: string;
+  // Shared bearer for the local Python Kronos process that POSTs forecasts.
+  // Without this set, /kronos/forecast returns 503 — read-only /kronos/latest
+  // still works.
+  KRONOS_API_KEY?: string;
 }
 
 const VALID_INTERVALS: BarInterval[] = ['1min', '5min', '15min', '30min', '60min'];
 
 export default {
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(refreshCaches(env, event.cron));
+  },
+
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const origin = request.headers.get('Origin');
@@ -55,7 +82,9 @@ async function route(url: URL, request: Request, env: Env): Promise<unknown> {
       throw new HttpError(400, `invalid interval; must be one of ${VALID_INTERVALS.join(', ')}`);
     }
     const limit = clampInt(url.searchParams.get('limit'), 1, 5000, 500);
-    return getBars(env.DB, symbol, interval, limit);
+    return interval === '1min'
+      ? getBars(env.DB, symbol, '1min', limit)
+      : getAggregatedBars(env.DB, symbol, interval, limit);
   }
 
   // /options/:symbol?expiration=YYYY-MM-DD
@@ -76,7 +105,166 @@ async function route(url: URL, request: Request, env: Env): Promise<unknown> {
     return getSignals(env.DB, limit);
   }
 
+  // /signals/by-symbol/:symbol?days=N
+  const sigSymMatch = path.match(/^\/signals\/by-symbol\/([A-Za-z.\-]+)$/);
+  if (sigSymMatch && request.method === 'GET') {
+    const symbol = sigSymMatch[1].toUpperCase();
+    const days = clampInt(url.searchParams.get('days'), 1, 30, 7);
+    return getSignalsForSymbol(env.DB, symbol, days);
+  }
+
+  // /backtest/:symbol?days=7&hold=30&cooldown=1800
+  const btMatch = path.match(/^\/backtest\/([A-Za-z.\-]+)$/);
+  if (btMatch && request.method === 'GET') {
+    const symbol = btMatch[1].toUpperCase();
+    const days = clampInt(url.searchParams.get('days'), 1, 30, 7);
+    const hold = clampInt(url.searchParams.get('hold'), 1, 240, 30);
+    const cooldown = clampInt(url.searchParams.get('cooldown'), 0, 86400, 1800);
+    const includeTrades = url.searchParams.get('trades') === '1';
+    const result = await runBacktest(env.DB, symbol, days, hold, cooldown);
+    return includeTrades ? result : { ...result, trades: [] };
+  }
+
+  // /ml/train?days=7&hold=30 — runs backtest, trains per-setup logreg, persists.
+  if (path === '/ml/train' && (request.method === 'POST' || request.method === 'GET')) {
+    const days = clampInt(url.searchParams.get('days'), 1, 30, 7);
+    const hold = clampInt(url.searchParams.get('hold'), 1, 240, 30);
+    const cooldown = clampInt(url.searchParams.get('cooldown'), 0, 86400, 1800);
+    return trainModels(env.DB, days, hold, cooldown);
+  }
+
+  if (path === '/ml/models' && request.method === 'GET') {
+    return getModels(env.DB);
+  }
+
+  // /backtest-summary?days=7&hold=30 — aggregated across all enabled tickers.
+  // Cached in D1 because the full sweep blows the free-tier 10ms CPU budget.
+  // Pass &refresh=1 to bypass cache (may 503 on free tier).
+  if (path === '/backtest-summary' && request.method === 'GET') {
+    const days = clampInt(url.searchParams.get('days'), 1, 30, 7);
+    const hold = clampInt(url.searchParams.get('hold'), 1, 240, 30);
+    const cooldown = clampInt(url.searchParams.get('cooldown'), 0, 86400, 1800);
+    const refresh = url.searchParams.get('refresh') === '1';
+    return getCachedBacktestSummary(env.DB, days, hold, cooldown, refresh);
+  }
+
+  // Reddit endpoints. The scraper worker writes reddit_posts +
+  // reddit_mentions; these are pure reads.
+  if (path === '/reddit/trending' && request.method === 'GET') {
+    const window = parseWindow(url.searchParams.get('window'), 24 * 3600);
+    const limit = clampInt(url.searchParams.get('limit'), 1, 200, 30);
+    const subreddit = url.searchParams.get('subreddit');
+    return getRedditTrending(env.DB, window, limit, subreddit);
+  }
+  if (path === '/reddit/diamonds' && request.method === 'GET') {
+    const recent = parseWindow(url.searchParams.get('recent'), 6 * 3600);
+    const baseline = parseWindow(url.searchParams.get('baseline'), 7 * 86400);
+    const limit = clampInt(url.searchParams.get('limit'), 1, 100, 20);
+    const subreddit = url.searchParams.get('subreddit');
+    return getRedditDiamonds(env.DB, recent, baseline, limit, subreddit);
+  }
+  const postsMatch = path.match(/^\/reddit\/posts\/?$/);
+  if (postsMatch && request.method === 'GET') {
+    const symbol = url.searchParams.get('symbol');
+    const limit = clampInt(url.searchParams.get('limit'), 1, 100, 25);
+    const subreddit = url.searchParams.get('subreddit');
+    return getRedditPosts(env.DB, symbol, limit, subreddit);
+  }
+
+  // Company news for a symbol via Finnhub.
+  const newsMatch = path.match(/^\/news\/([A-Za-z.^\-]+)$/);
+  if (newsMatch && request.method === 'GET') {
+    const symbol = newsMatch[1]!.toUpperCase();
+    const limit = clampInt(url.searchParams.get('limit'), 1, 50, 20);
+    return getCompanyNews(env, symbol, limit);
+  }
+
+  // Options chain for a symbol — nearest expiration by default. Yahoo's
+  // free options endpoint with Black-Scholes greeks computed in-worker.
+  const optionsMatch2 = path.match(/^\/options-chain\/([A-Za-z.\-]+)$/);
+  if (optionsMatch2 && request.method === 'GET') {
+    const symbol = optionsMatch2[1]!.toUpperCase();
+    const expiration = url.searchParams.get('expiration');
+    return getOptionsChain(env, symbol, expiration ? Number(expiration) : null);
+  }
+
+  // Earnings calendar for the next N days (default 7). Symbols across the
+  // whole US market — the dashboard highlights watchlist ones. Cached for
+  // 30 min in json_cache since the calendar doesn't change minute-to-minute.
+  if (path === '/earnings' && request.method === 'GET') {
+    const days = clampInt(url.searchParams.get('days'), 1, 30, 7);
+    return getEarningsCalendar(env, days);
+  }
+
+  // Most recent Kronos forecast per symbol (one row per symbol, latest
+  // generated_at). Used by the Kronos dashboard tab.
+  const kronosLatestMatch = path === '/kronos/latest' && request.method === 'GET';
+  if (kronosLatestMatch) {
+    return getKronosLatest(env);
+  }
+
+  // Local Python worker posts a batch of forecasts here. Bearer-auth via
+  // KRONOS_API_KEY. Body: { model: string, generated_at?: number,
+  // forecasts: Array<KronosForecastInput> }.
+  const kronosPostMatch = path === '/kronos/forecast' && request.method === 'POST';
+  if (kronosPostMatch) {
+    return postKronosForecasts(env, request);
+  }
+
+  // All persisted backtest stats. Read-only; the dashboard's Kronos tab
+  // uses /kronos/latest which already joins these in.
+  if (path === '/kronos/backtest' && request.method === 'GET') {
+    return getKronosBacktest(env);
+  }
+
+  // Local Python posts a batch of backtest results here. Bearer-auth.
+  if (path === '/kronos/backtest' && request.method === 'POST') {
+    return postKronosBacktest(env, request);
+  }
+
+  // Chronos endpoints mirror the Kronos shape. The dashboard fetches both
+  // and ensembles client-side. Auth shares KRONOS_API_KEY since both
+  // models are run by the same local Python harness on the user's Mac.
+  if (path === '/chronos/latest' && request.method === 'GET') {
+    return getChronosLatest(env);
+  }
+  if (path === '/chronos/forecast' && request.method === 'POST') {
+    return postChronosForecasts(env, request);
+  }
+  if (path === '/chronos/backtest' && request.method === 'GET') {
+    return getChronosBacktest(env);
+  }
+  if (path === '/chronos/backtest' && request.method === 'POST') {
+    return postChronosBacktest(env, request);
+  }
+
+  // Triggers an on-demand scrape on the reddit worker via the service
+  // binding. The reddit worker doesn't ship CORS headers, so the dashboard
+  // hits this proxy instead.
+  if (path === '/reddit/scrape' && (request.method === 'POST' || request.method === 'GET')) {
+    if (!env.REDDIT) {
+      throw new HttpError(503, 'reddit service binding not configured');
+    }
+    const upstream = await env.REDDIT.fetch('https://reddit.internal/run');
+    if (!upstream.ok) {
+      throw new HttpError(upstream.status, `reddit worker ${upstream.status}`);
+    }
+    return upstream.json();
+  }
+
   throw new HttpError(404, 'not found');
+}
+
+function parseWindow(raw: string | null, fallbackSeconds: number): number {
+  // Accepts plain integers (seconds) or shorthand like '24h' / '7d' / '30m'.
+  if (!raw) return fallbackSeconds;
+  const m = raw.match(/^(\d+)([smhd])?$/);
+  if (!m) return fallbackSeconds;
+  const n = parseInt(m[1] ?? '', 10);
+  if (!Number.isFinite(n)) return fallbackSeconds;
+  const unit = m[2] ?? 's';
+  const mul = unit === 'd' ? 86400 : unit === 'h' ? 3600 : unit === 'm' ? 60 : 1;
+  return Math.min(30 * 86400, Math.max(60, n * mul));
 }
 
 class HttpError extends Error {
@@ -138,6 +326,58 @@ async function getBars(
   return results.reverse();
 }
 
+const INTERVAL_SECONDS: Record<BarInterval, number> = {
+  '1min': 60,
+  '5min': 300,
+  '15min': 900,
+  '30min': 1800,
+  '60min': 3600,
+};
+
+// Roll the stored 1min bars up into the requested interval. Cheaper than
+// storing every interval separately (the ingest worker only writes 1min)
+// and instant — D1 read + in-memory aggregation, no extra fetches.
+async function getAggregatedBars(
+  db: D1Database,
+  symbol: string,
+  interval: BarInterval,
+  limit: number,
+): Promise<Bar[]> {
+  const bucketSec = INTERVAL_SECONDS[interval];
+  // Pull enough 1min bars to fill `limit` aggregated bars, capped at 5000
+  // for safety. e.g. limit=500 5min bars -> need 2500 1min bars.
+  const oneMinLimit = Math.min(5000, limit * (bucketSec / 60));
+  const ones = await getBars(db, symbol, '1min', oneMinLimit);
+  if (ones.length === 0) return [];
+
+  // ones is ascending; bucket by floor(ts/bucketSec) and fold OHLC.
+  const buckets = new Map<number, Bar>();
+  for (const b of ones) {
+    const bucketTs = Math.floor(b.ts / bucketSec) * bucketSec;
+    const existing = buckets.get(bucketTs);
+    if (!existing) {
+      buckets.set(bucketTs, {
+        symbol: b.symbol,
+        interval,
+        ts: bucketTs,
+        open: b.open,
+        high: b.high,
+        low: b.low,
+        close: b.close,
+        volume: b.volume,
+      });
+    } else {
+      existing.high = Math.max(existing.high, b.high);
+      existing.low = Math.min(existing.low, b.low);
+      existing.close = b.close; // last close wins (ones is sorted ascending)
+      existing.volume += b.volume;
+    }
+  }
+  return Array.from(buckets.values())
+    .sort((a, b) => a.ts - b.ts)
+    .slice(-limit);
+}
+
 async function getLatestOptions(
   db: D1Database,
   underlying: string,
@@ -197,6 +437,537 @@ async function getIngestRuns(db: D1Database, limit: number): Promise<IngestRun[]
   }));
 }
 
+async function loadBarsSince(
+  db: D1Database,
+  symbol: string,
+  interval: BarInterval,
+  sinceTs: number,
+): Promise<Bar[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT symbol, interval, ts, open, high, low, close, volume
+         FROM bars
+        WHERE symbol = ? AND interval = ? AND ts >= ?
+        ORDER BY ts ASC`,
+    )
+    .bind(symbol, interval, sinceTs)
+    .all<Bar>();
+  return results;
+}
+
+async function runBacktest(
+  db: D1Database,
+  symbol: string,
+  days: number,
+  holdMinutes: number,
+  cooldownSec: number,
+): Promise<BacktestResult> {
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+  const bars = await loadBarsSince(db, symbol, '1min', sinceTs);
+  return backtest(symbol, bars, holdMinutes, cooldownSec);
+}
+
+// Cron entry point. Branches on the schedule that fired so the daily
+// after-close trigger doesn't re-run the expensive ML retrain.
+async function refreshCaches(env: Env, cron: string): Promise<void> {
+  const isWeeklyRetrain = cron === '0 6 * * SUN';
+  if (isWeeklyRetrain) {
+    try {
+      await trainModels(env.DB, 7, 30, 1800);
+    } catch (err) {
+      console.error('weekly retrain failed', err);
+    }
+  }
+  // Refresh the cached backtest summaries the dashboard reads. We always
+  // refresh both windows so each daily run keeps the '1d' tab fresh and the
+  // weekly run keeps the '7d' tab fresh; the cost is one extra sweep.
+  for (const days of [1, 7] as const) {
+    try {
+      const summary = await getBacktestSummary(env.DB, days, 30, 1800);
+      await writeCache(env.DB, `backtest-summary-v2-${days}-30-1800`, JSON.stringify(summary));
+    } catch (err) {
+      console.error(`backtest cache refresh failed (days=${days})`, err);
+    }
+  }
+}
+
+async function getCachedBacktestSummary(
+  db: D1Database,
+  days: number,
+  holdMinutes: number,
+  cooldownSec: number,
+  refresh: boolean,
+): Promise<{
+  symbols: number;
+  trades: number;
+  bySetup: SetupStats[];
+  bySymbol: Array<{ symbol: string; trades: number; bySetup: SetupStats[] }>;
+  cachedAt: number | null;
+  stale: boolean;
+}> {
+  // v2 bump invalidates pre-bySymbol cached payloads.
+  const key = `backtest-summary-v2-${days}-${holdMinutes}-${cooldownSec}`;
+  if (!refresh) {
+    const row = await db
+      .prepare('SELECT value, updated_at FROM json_cache WHERE key = ?')
+      .bind(key)
+      .first<{ value: string; updated_at: number }>();
+    if (row) {
+      const ageHours = (Math.floor(Date.now() / 1000) - row.updated_at) / 3600;
+      const parsed = JSON.parse(row.value) as {
+        symbols: number;
+        trades: number;
+        bySetup: SetupStats[];
+        bySymbol: Array<{ symbol: string; trades: number; bySetup: SetupStats[] }>;
+      };
+      return { ...parsed, cachedAt: row.updated_at, stale: ageHours > 24 };
+    }
+  }
+  const fresh = await getBacktestSummary(db, days, holdMinutes, cooldownSec);
+  await writeCache(db, key, JSON.stringify(fresh));
+  return { ...fresh, cachedAt: Math.floor(Date.now() / 1000), stale: false };
+}
+
+interface NewsItem {
+  id: number;
+  headline: string;
+  summary: string;
+  source: string;
+  url: string;
+  datetime: number;
+  image?: string;
+}
+
+// Fetch company news for a symbol. 30-minute cache in json_cache so a
+// page refresh hitting 47 tickers doesn't blow Finnhub's free-tier
+// 60 req/min budget.
+async function getCompanyNews(env: Env, symbol: string, limit: number): Promise<NewsItem[]> {
+  if (!env.FINNHUB_API_KEY) {
+    throw new HttpError(503, 'FINNHUB_API_KEY not configured on api worker');
+  }
+  const key = `news-${symbol}`;
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    const row = await env.DB
+      .prepare('SELECT value, updated_at FROM json_cache WHERE key = ?')
+      .bind(key)
+      .first<{ value: string; updated_at: number }>();
+    if (row && now - row.updated_at < 30 * 60) {
+      return (JSON.parse(row.value) as NewsItem[]).slice(0, limit);
+    }
+  } catch {
+    // Cache lookup failure shouldn't break the request; fall through to live fetch.
+  }
+  // Finnhub /company-news returns recent news with sentiment; we trim
+  // payload to fields the dashboard renders.
+  const to = new Date(now * 1000).toISOString().slice(0, 10);
+  const from = new Date((now - 7 * 86400) * 1000).toISOString().slice(0, 10);
+  // ^VIX / ^TNX aren't tradeable equities; Finnhub returns 404. Strip the
+  // caret so we get the index proxy news (e.g. ^VIX -> VIX).
+  const finnhubSym = symbol.replace(/^\^/, '');
+  const u = `https://finnhub.io/api/v1/company-news?symbol=${encodeURIComponent(finnhubSym)}&from=${from}&to=${to}&token=${env.FINNHUB_API_KEY}`;
+  let news: NewsItem[] = [];
+  try {
+    const res = await fetch(u, { signal: AbortSignal.timeout(8_000) });
+    if (res.ok) {
+      const raw = (await res.json()) as Array<{
+        id: number; headline: string; summary: string; source: string;
+        url: string; datetime: number; image?: string;
+      }>;
+      news = raw.map((n) => ({
+        id: n.id,
+        headline: n.headline,
+        summary: n.summary,
+        source: n.source,
+        url: n.url,
+        datetime: n.datetime,
+        image: n.image,
+      }));
+    }
+  } catch {
+    // Upstream failures fall through to returning an empty cache write so
+    // we don't hammer Finnhub on repeated failures.
+  }
+  try {
+    await env.DB
+      .prepare(
+        `INSERT INTO json_cache(key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+      )
+      .bind(key, JSON.stringify(news), now)
+      .run();
+  } catch {
+    // Best-effort cache write.
+  }
+  return news.slice(0, limit);
+}
+
+interface EarningsItem {
+  symbol: string;
+  date: string;       // 'YYYY-MM-DD'
+  hour: string;       // 'bmo' (before open) | 'amc' (after close) | ''
+  epsEstimate: number | null;
+  epsActual: number | null;
+  revenueEstimate: number | null;
+  revenueActual: number | null;
+  quarter: number;
+  year: number;
+}
+
+interface FinnhubEarningsResponse {
+  earningsCalendar?: Array<{
+    symbol?: string;
+    date?: string;
+    hour?: string;
+    epsEstimate?: number | null;
+    epsActual?: number | null;
+    revenueEstimate?: number | null;
+    revenueActual?: number | null;
+    quarter?: number;
+    year?: number;
+  }>;
+}
+
+async function getEarningsCalendar(env: Env, days: number): Promise<EarningsItem[]> {
+  if (!env.FINNHUB_API_KEY) {
+    throw new HttpError(503, 'FINNHUB_API_KEY not configured on api worker');
+  }
+  const key = `earnings-${days}`;
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    const row = await env.DB
+      .prepare('SELECT value, updated_at FROM json_cache WHERE key = ?')
+      .bind(key)
+      .first<{ value: string; updated_at: number }>();
+    if (row && now - row.updated_at < 1800) {
+      return JSON.parse(row.value) as EarningsItem[];
+    }
+  } catch {
+    // Fall through.
+  }
+
+  const today = new Date();
+  const fromStr = today.toISOString().slice(0, 10);
+  const to = new Date(today.getTime() + days * 86400_000);
+  const toStr = to.toISOString().slice(0, 10);
+  const url =
+    `https://finnhub.io/api/v1/calendar/earnings?from=${fromStr}&to=${toStr}` +
+    `&token=${env.FINNHUB_API_KEY}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) throw new HttpError(res.status, `finnhub earnings ${res.status}`);
+  const json = (await res.json()) as FinnhubEarningsResponse;
+  const raw = json.earningsCalendar ?? [];
+  const items: EarningsItem[] = raw
+    .filter((r) => r.symbol && r.date)
+    .map((r) => ({
+      symbol: r.symbol!.toUpperCase(),
+      date: r.date!,
+      hour: r.hour ?? '',
+      epsEstimate: typeof r.epsEstimate === 'number' ? r.epsEstimate : null,
+      epsActual: typeof r.epsActual === 'number' ? r.epsActual : null,
+      revenueEstimate: typeof r.revenueEstimate === 'number' ? r.revenueEstimate : null,
+      revenueActual: typeof r.revenueActual === 'number' ? r.revenueActual : null,
+      quarter: r.quarter ?? 0,
+      year: r.year ?? 0,
+    }))
+    .sort((a, b) => {
+      if (a.date !== b.date) return a.date.localeCompare(b.date);
+      // 'bmo' before 'amc' before '' so morning calls show up first.
+      const order = (h: string) => (h === 'bmo' ? 0 : h === 'amc' ? 1 : 2);
+      const ho = order(a.hour) - order(b.hour);
+      if (ho !== 0) return ho;
+      return a.symbol.localeCompare(b.symbol);
+    });
+  try {
+    await env.DB
+      .prepare(
+        `INSERT INTO json_cache(key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+      )
+      .bind(key, JSON.stringify(items), now)
+      .run();
+  } catch {
+    // Best-effort.
+  }
+  return items;
+}
+
+async function writeCache(db: D1Database, key: string, value: string): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO json_cache(key, value, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    )
+    .bind(key, value, Math.floor(Date.now() / 1000))
+    .run();
+}
+
+async function getBacktestSummary(
+  db: D1Database,
+  days: number,
+  holdMinutes: number,
+  cooldownSec: number,
+): Promise<{ symbols: number; trades: number; bySetup: SetupStats[]; bySymbol: Array<{ symbol: string; trades: number; bySetup: SetupStats[] }> }> {
+  const tickers = await db
+    .prepare('SELECT symbol FROM tickers WHERE enabled = 1 ORDER BY symbol')
+    .all<{ symbol: string }>();
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+  const symbolBars = await Promise.all(
+    tickers.results.map(async ({ symbol }) => ({
+      symbol,
+      bars: await loadBarsSince(db, symbol, '1min', sinceTs),
+    })),
+  );
+  const results: BacktestResult[] = [];
+  for (const { symbol, bars } of symbolBars) {
+    if (bars.length < 30) continue;
+    results.push(backtest(symbol, bars, holdMinutes, cooldownSec));
+  }
+  const totalTrades = results.reduce((sum, r) => sum + r.trades.length, 0);
+  return {
+    symbols: results.length,
+    trades: totalTrades,
+    bySetup: combineResults(results),
+    bySymbol: results.map((r) => ({
+      symbol: r.symbol,
+      trades: r.trades.length,
+      bySetup: r.bySetup,
+    })),
+  };
+}
+
+// Hold periods (minutes) the trainer produces models for. Each horizon
+// gets its own per-setup models and meta-ensemble — outcomes at 15m vs
+// 60m can differ wildly, so single-horizon training was leaving signal
+// on the table. The first entry is used as the "primary" hold reported
+// in the legacy response shape.
+const TRAIN_HOLDS_MINUTES = [15, 30, 60, 120] as const;
+
+async function trainModels(
+  db: D1Database,
+  days: number,
+  primaryHoldMinutes: number,
+  cooldownSec: number,
+): Promise<{
+  perSetup: Array<{ setup: SetupName; samples: number; trainAcc: number; valAcc: number; baseline: number }>;
+  meta: { samples: number; trainAcc: number; valAcc: number; baseline: number } | null;
+  byHold: Array<{
+    holdMinutes: number;
+    perSetup: Array<{ setup: SetupName; samples: number; trainAcc: number; valAcc: number; baseline: number }>;
+    meta: { samples: number; trainAcc: number; valAcc: number; baseline: number } | null;
+    trades: number;
+  }>;
+  symbols: number;
+  trades: number;
+}> {
+  const tickers = await db
+    .prepare('SELECT symbol FROM tickers WHERE enabled = 1 ORDER BY symbol')
+    .all<{ symbol: string }>();
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+  const symbolBars = await Promise.all(
+    tickers.results.map(async ({ symbol }) => ({
+      symbol,
+      bars: await loadBarsSince(db, symbol, '1min', sinceTs),
+    })),
+  );
+
+  // Holds we train at — union of the requested primary hold and the
+  // standard set, deduped.
+  const holds = Array.from(new Set([primaryHoldMinutes, ...TRAIN_HOLDS_MINUTES])).sort((a, b) => a - b);
+  const trainedAt = Math.floor(Date.now() / 1000);
+
+  const byHold: Array<{
+    holdMinutes: number;
+    perSetup: Array<{ setup: SetupName; samples: number; trainAcc: number; valAcc: number; baseline: number }>;
+    meta: { samples: number; trainAcc: number; valAcc: number; baseline: number } | null;
+    trades: number;
+  }> = [];
+
+  let symbolsUsedMax = 0;
+  let primaryPerSetup: Array<{ setup: SetupName; samples: number; trainAcc: number; valAcc: number; baseline: number }> = [];
+  let primaryMeta: { samples: number; trainAcc: number; valAcc: number; baseline: number } | null = null;
+  let primaryTrades = 0;
+
+  for (const hold of holds) {
+    interface TradeRow {
+      setup: SetupName;
+      direction: 'long' | 'short';
+      features: number[];
+      won: number;
+    }
+    const allTrades: TradeRow[] = [];
+    let symbolsUsed = 0;
+    for (const { bars } of symbolBars) {
+      if (bars.length < 30) continue;
+      symbolsUsed += 1;
+      const result = backtest('-', bars, hold, cooldownSec);
+      for (const t of result.trades) {
+        allTrades.push({
+          setup: t.setup,
+          direction: t.direction,
+          features: featuresToVector(t.features),
+          won: t.pnlPct > 0 ? 1 : 0,
+        });
+      }
+    }
+    symbolsUsedMax = Math.max(symbolsUsedMax, symbolsUsed);
+
+    const bySetup = new Map<SetupName, { X: number[][]; y: number[] }>();
+    for (const t of allTrades) {
+      const bucket = bySetup.get(t.setup) ?? { X: [], y: [] };
+      bucket.X.push(t.features);
+      bucket.y.push(t.won);
+      bySetup.set(t.setup, bucket);
+    }
+
+    const perSetup: typeof primaryPerSetup = [];
+    const trainedPerSetupModels = new Map<SetupName, Model>();
+
+    for (const [setup, { X, y }] of bySetup) {
+      if (X.length < 30) continue;
+      const trained = trainLogReg(X, y);
+      const stats: ModelStats = trained.stats;
+      const model: Model = {
+        setup,
+        featureNames: FEATURE_NAMES,
+        means: trained.means,
+        stds: trained.stds,
+        weights: trained.weights,
+        bias: trained.bias,
+        trainedAt,
+        stats,
+        calibA: trained.calibA,
+        calibB: trained.calibB,
+      };
+      trainedPerSetupModels.set(setup, model);
+      const json = modelToJson(model);
+      await db
+        .prepare(
+          `INSERT INTO models(setup, hold_minutes, trained_at, sample_count,
+                              train_accuracy, val_accuracy, train_baseline,
+                              weights_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(setup, hold_minutes) DO UPDATE SET
+             trained_at = excluded.trained_at,
+             sample_count = excluded.sample_count,
+             train_accuracy = excluded.train_accuracy,
+             val_accuracy = excluded.val_accuracy,
+             train_baseline = excluded.train_baseline,
+             weights_json = excluded.weights_json`,
+        )
+        .bind(setup, hold, trainedAt, stats.sampleCount, stats.trainAccuracy, stats.valAccuracy, stats.trainBaseline, json)
+        .run();
+      perSetup.push({
+        setup,
+        samples: stats.sampleCount,
+        trainAcc: stats.trainAccuracy,
+        valAcc: stats.valAccuracy,
+        baseline: stats.trainBaseline,
+      });
+    }
+
+    // Meta ensemble for this horizon.
+    const metaX: number[][] = [];
+    const metaY: number[] = [];
+    for (const t of allTrades) {
+      const model = trainedPerSetupModels.get(t.setup);
+      if (!model) continue;
+      const setupProb = predict(model, t.features);
+      metaX.push(buildMetaVector(setupProb, t.setup, t.direction, t.features));
+      metaY.push(t.won);
+    }
+    let meta: { samples: number; trainAcc: number; valAcc: number; baseline: number } | null = null;
+    if (metaX.length >= 50) {
+      const trained = trainLogReg(metaX, metaY);
+      const stats = trained.stats;
+      const json = modelToJson({
+        setup: '__meta__' as SetupName,
+        featureNames: FEATURE_NAMES,
+        means: trained.means,
+        stds: trained.stds,
+        weights: trained.weights,
+        bias: trained.bias,
+        trainedAt,
+        stats,
+        calibA: trained.calibA,
+        calibB: trained.calibB,
+      });
+      await db
+        .prepare(
+          `INSERT INTO meta_model(hold_minutes, trained_at, sample_count,
+                                  train_accuracy, val_accuracy, train_baseline,
+                                  weights_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(hold_minutes) DO UPDATE SET
+             trained_at = excluded.trained_at,
+             sample_count = excluded.sample_count,
+             train_accuracy = excluded.train_accuracy,
+             val_accuracy = excluded.val_accuracy,
+             train_baseline = excluded.train_baseline,
+             weights_json = excluded.weights_json`,
+        )
+        .bind(hold, trainedAt, stats.sampleCount, stats.trainAccuracy, stats.valAccuracy, stats.trainBaseline, json)
+        .run();
+      meta = {
+        samples: stats.sampleCount,
+        trainAcc: stats.trainAccuracy,
+        valAcc: stats.valAccuracy,
+        baseline: stats.trainBaseline,
+      };
+    }
+
+    perSetup.sort((a, b) => a.setup.localeCompare(b.setup));
+    byHold.push({ holdMinutes: hold, perSetup, meta, trades: allTrades.length });
+    if (hold === primaryHoldMinutes) {
+      primaryPerSetup = perSetup;
+      primaryMeta = meta;
+      primaryTrades = allTrades.length;
+    }
+  }
+
+  return {
+    perSetup: primaryPerSetup,
+    meta: primaryMeta,
+    byHold,
+    symbols: symbolsUsedMax,
+    trades: primaryTrades,
+  };
+}
+
+async function getModels(db: D1Database): Promise<unknown> {
+  const perSetup = await db
+    .prepare(
+      `SELECT setup, hold_minutes, trained_at, sample_count, train_accuracy,
+              val_accuracy, train_baseline
+         FROM models
+        ORDER BY hold_minutes, setup`,
+    )
+    .all();
+  const meta = await db
+    .prepare(
+      `SELECT hold_minutes, trained_at, sample_count, train_accuracy,
+              val_accuracy, train_baseline
+         FROM meta_model
+        ORDER BY hold_minutes`,
+    )
+    .all();
+  return { perSetup: perSetup.results, meta: meta.results };
+}
+
+async function getSignalsForSymbol(db: D1Database, symbol: string, days: number): Promise<unknown[]> {
+  const sinceTs = Math.floor(Date.now() / 1000) - days * 86400;
+  const { results } = await db
+    .prepare(
+      `SELECT id, symbol, ts, setup, direction, ml_probability, notes
+         FROM signals
+        WHERE symbol = ? AND ts >= ?
+        ORDER BY ts ASC`,
+    )
+    .bind(symbol, sinceTs)
+    .all();
+  return results;
+}
+
 async function getSignals(db: D1Database, limit: number): Promise<unknown[]> {
   const { results } = await db
     .prepare(
@@ -210,3 +981,1262 @@ async function getSignals(db: D1Database, limit: number): Promise<unknown[]> {
     .all();
   return results;
 }
+
+interface TrendingRow {
+  symbol: string;
+  posts: number;
+  mentions: number;
+  net_sentiment: number;
+  total_score: number;
+  top_post_id: string | null;
+  top_post_title: string | null;
+}
+
+async function getRedditTrending(
+  db: D1Database,
+  windowSeconds: number,
+  limit: number,
+  subreddit: string | null,
+): Promise<RedditTrending[]> {
+  const since = Math.floor(Date.now() / 1000) - windowSeconds;
+  // For each symbol in the window, take the highest-scoring post as the
+  // 'top post' surface. Done with a correlated subquery for portability —
+  // D1's SQLite supports it cleanly.
+  const sql = `
+    SELECT m.symbol                                             AS symbol,
+           COUNT(DISTINCT p.id)                                 AS posts,
+           SUM(m.mention_count)                                 AS mentions,
+           AVG(m.sentiment)                                     AS net_sentiment,
+           SUM(p.score)                                         AS total_score,
+           (SELECT p2.id    FROM reddit_mentions m2
+              JOIN reddit_posts p2 ON p2.id = m2.post_id
+             WHERE m2.symbol = m.symbol
+               AND p2.created_utc >= ?1
+               ${subreddit ? 'AND p2.subreddit = ?4' : ''}
+             ORDER BY p2.score DESC LIMIT 1)                    AS top_post_id,
+           (SELECT p2.title FROM reddit_mentions m2
+              JOIN reddit_posts p2 ON p2.id = m2.post_id
+             WHERE m2.symbol = m.symbol
+               AND p2.created_utc >= ?1
+               ${subreddit ? 'AND p2.subreddit = ?4' : ''}
+             ORDER BY p2.score DESC LIMIT 1)                    AS top_post_title
+      FROM reddit_mentions m
+      JOIN reddit_posts p ON p.id = m.post_id
+     WHERE p.created_utc >= ?1
+       ${subreddit ? 'AND p.subreddit = ?4' : ''}
+     GROUP BY m.symbol
+     ORDER BY mentions DESC, posts DESC
+     LIMIT ?2`;
+  const stmt = subreddit
+    ? db.prepare(sql).bind(since, limit, since, subreddit)
+    : db.prepare(sql).bind(since, limit);
+  const { results } = await stmt.all<TrendingRow>();
+  return results.map((r) => ({
+    symbol: r.symbol,
+    posts: r.posts,
+    mentions: r.mentions,
+    netSentiment: r.net_sentiment,
+    totalScore: r.total_score,
+    topPostId: r.top_post_id,
+    topPostTitle: r.top_post_title,
+  }));
+}
+
+async function getRedditDiamonds(
+  db: D1Database,
+  recentSeconds: number,
+  baselineSeconds: number,
+  limit: number,
+  subreddit: string | null,
+): Promise<RedditDiamond[]> {
+  const now = Math.floor(Date.now() / 1000);
+  const recentSince = now - recentSeconds;
+  const baselineSince = now - baselineSeconds;
+
+  // Recent vs. baseline mention counts per symbol. spike_ratio is normalised
+  // by window length so a 6h burst on a symbol with low 7d activity scores
+  // higher than something that's been steady all week.
+  const subFilter = subreddit ? 'AND p.subreddit = ?5' : '';
+  const sql = `
+    WITH recent AS (
+      SELECT m.symbol, SUM(m.mention_count) AS mentions, COUNT(DISTINCT p.id) AS posts,
+             AVG(m.sentiment) AS net_sentiment, SUM(p.score) AS total_score
+        FROM reddit_mentions m JOIN reddit_posts p ON p.id = m.post_id
+       WHERE p.created_utc >= ?1 ${subFilter}
+       GROUP BY m.symbol
+    ),
+    baseline AS (
+      SELECT m.symbol, SUM(m.mention_count) AS mentions
+        FROM reddit_mentions m JOIN reddit_posts p ON p.id = m.post_id
+       WHERE p.created_utc >= ?2 AND p.created_utc < ?1 ${subFilter}
+       GROUP BY m.symbol
+    ),
+    top_post AS (
+      SELECT m.symbol, p.id AS top_post_id, p.title AS top_post_title,
+             ROW_NUMBER() OVER (PARTITION BY m.symbol ORDER BY p.score DESC) AS rn
+        FROM reddit_mentions m JOIN reddit_posts p ON p.id = m.post_id
+       WHERE p.created_utc >= ?1 ${subFilter}
+    )
+    SELECT r.symbol                                            AS symbol,
+           r.posts                                             AS posts,
+           r.mentions                                          AS mentions,
+           r.net_sentiment                                     AS net_sentiment,
+           r.total_score                                       AS total_score,
+           t.top_post_id                                       AS top_post_id,
+           t.top_post_title                                    AS top_post_title,
+           COALESCE(b.mentions, 0)                             AS baseline_mentions,
+           -- recent_rate / baseline_rate, with a small floor so brand-new
+           -- symbols (baseline = 0) don't divide by zero. baseline_rate is
+           -- mentions normalized to the recent-window length.
+           (CAST(r.mentions AS REAL) / (?3 / 3600.0))
+             / ((CAST(COALESCE(b.mentions, 0) AS REAL) + 0.5)
+                / ((?4 - ?3) / 3600.0))                        AS spike_ratio
+      FROM recent r
+      LEFT JOIN baseline b ON b.symbol = r.symbol
+      LEFT JOIN top_post  t ON t.symbol = r.symbol AND t.rn = 1
+     WHERE r.mentions >= 2
+     ORDER BY spike_ratio DESC, r.mentions DESC
+     LIMIT ?6`;
+  const stmt = subreddit
+    ? db.prepare(sql).bind(recentSince, baselineSince, recentSeconds, baselineSeconds, subreddit, limit)
+    : db.prepare(sql).bind(recentSince, baselineSince, recentSeconds, baselineSeconds, limit);
+  const { results } = await stmt.all<TrendingRow & { baseline_mentions: number; spike_ratio: number }>();
+  return results.map((r) => ({
+    symbol: r.symbol,
+    posts: r.posts,
+    mentions: r.mentions,
+    netSentiment: r.net_sentiment,
+    totalScore: r.total_score,
+    topPostId: r.top_post_id,
+    topPostTitle: r.top_post_title,
+    baselineMentions: r.baseline_mentions,
+    spikeRatio: r.spike_ratio,
+  }));
+}
+
+interface PostRow {
+  id: string;
+  subreddit: string;
+  author: string | null;
+  title: string;
+  selftext: string | null;
+  flair: string | null;
+  score: number;
+  num_comments: number;
+  permalink: string | null;
+  url: string | null;
+  created_utc: number;
+  fetched_at: number;
+}
+
+async function getRedditPosts(
+  db: D1Database,
+  symbol: string | null,
+  limit: number,
+  subreddit: string | null,
+): Promise<RedditPost[]> {
+  let stmt: D1PreparedStatement;
+  if (symbol) {
+    const sym = symbol.toUpperCase();
+    const sql = `SELECT p.id, p.subreddit, p.author, p.title, p.selftext, p.flair,
+                        p.score, p.num_comments, p.permalink, p.url,
+                        p.created_utc, p.fetched_at
+                   FROM reddit_posts p
+                   JOIN reddit_mentions m ON m.post_id = p.id
+                  WHERE m.symbol = ?
+                  ${subreddit ? 'AND p.subreddit = ?3' : ''}
+                  ORDER BY p.created_utc DESC
+                  LIMIT ?2`;
+    stmt = subreddit
+      ? db.prepare(sql).bind(sym, limit, subreddit)
+      : db.prepare(sql).bind(sym, limit);
+  } else {
+    const sql = `SELECT id, subreddit, author, title, selftext, flair,
+                        score, num_comments, permalink, url,
+                        created_utc, fetched_at
+                   FROM reddit_posts
+                  ${subreddit ? 'WHERE subreddit = ?2' : ''}
+                  ORDER BY created_utc DESC
+                  LIMIT ?1`;
+    stmt = subreddit ? db.prepare(sql).bind(limit, subreddit) : db.prepare(sql).bind(limit);
+  }
+  const { results } = await stmt.all<PostRow>();
+  return results.map((r) => ({
+    id: r.id,
+    subreddit: r.subreddit,
+    author: r.author,
+    title: r.title,
+    selftext: r.selftext,
+    flair: r.flair,
+    score: r.score,
+    numComments: r.num_comments,
+    permalink: r.permalink,
+    url: r.url,
+    createdUtc: r.created_utc,
+    fetchedAt: r.fetched_at,
+  }));
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// Options chain (Yahoo free endpoint + Black-Scholes greeks)
+// ─────────────────────────────────────────────────────────────────────────
+
+interface OptionContract {
+  contractSymbol: string;
+  strike: number;
+  bid: number | null;
+  ask: number | null;
+  last: number | null;
+  high: number | null;
+  low: number | null;
+  volume: number | null;
+  openInterest: number | null;
+  impliedVolatility: number | null;
+  inTheMoney: boolean;
+  delta: number | null;
+  gamma: number | null;
+  theta: number | null;
+  vega: number | null;
+}
+
+interface OptionsChainResponse {
+  symbol: string;
+  spot: number;
+  dayHigh: number | null;
+  dayLow: number | null;
+  dayChange: number | null;
+  dayChangePct: number | null;
+  prevClose: number | null;
+  expiration: number; // unix seconds
+  expirationDate: string; // YYYY-MM-DD
+  daysToExpiry: number;
+  availableExpirations: number[]; // all expirations Yahoo offers
+  calls: OptionContract[];
+  puts: OptionContract[];
+}
+
+// Fetch a symbol's options chain from Yahoo's free endpoint. Cached in
+// json_cache for 60s — chains barely move between page loads, and we'd
+// otherwise burn rate budget on every dashboard refresh.
+async function getOptionsChain(
+  env: Env,
+  symbol: string,
+  expirationTs: number | null,
+): Promise<OptionsChainResponse> {
+  const cacheKey = `options-${symbol}-${expirationTs ?? 'nearest'}`;
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    const row = await env.DB
+      .prepare('SELECT value, updated_at FROM json_cache WHERE key = ?')
+      .bind(cacheKey)
+      .first<{ value: string; updated_at: number }>();
+    if (row && now - row.updated_at < 60) {
+      return JSON.parse(row.value) as OptionsChainResponse;
+    }
+  } catch {
+    // Fall through to live fetch.
+  }
+
+  // Try CBOE first — public CDN endpoint, no auth, ~15min delayed, ships
+  // greeks pre-computed. Falls back to Finnhub then Yahoo if CBOE doesn't
+  // list the symbol (rare; mostly exotic tickers).
+  const cboeResult = await tryCboeChain(symbol, expirationTs);
+  const finnhubResult = !cboeResult && env.FINNHUB_API_KEY
+    ? await tryFinnhubChain(env.FINNHUB_API_KEY, symbol, expirationTs)
+    : null;
+
+  let response: OptionsChainResponse;
+  if (cboeResult) {
+    response = cboeResult;
+  } else if (finnhubResult) {
+    response = finnhubResult;
+  } else {
+    // Yahoo fallback. Their v7 endpoint is fussier than the chart endpoint;
+    // send realistic browser headers and rotate hosts to dodge 401s.
+    const hosts = ['https://query2.finance.yahoo.com', 'https://query1.finance.yahoo.com'];
+    const dateParam = expirationTs ? `&date=${expirationTs}` : '';
+    const yahooPath = `/v7/finance/options/${encodeURIComponent(symbol)}?lang=en-US&region=US${dateParam}`;
+    const browserHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      Accept: 'application/json,text/plain,*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      Referer: 'https://finance.yahoo.com/',
+      Origin: 'https://finance.yahoo.com',
+    };
+    let res: Response | null = null;
+    let lastStatus = 0;
+    for (const host of hosts) {
+      const r = await fetch(`${host}${yahooPath}`, { headers: browserHeaders, signal: AbortSignal.timeout(8_000) });
+      if (r.ok) {
+        res = r;
+        break;
+      }
+      lastStatus = r.status;
+    }
+    if (!res) {
+      throw new HttpError(
+        lastStatus || 502,
+        `All options sources failed for ${symbol}. CBOE has no listing; Yahoo returned ${lastStatus}; Finnhub likely needs paid tier.`,
+      );
+    }
+    const json = (await res.json()) as YahooOptionsResponse;
+    const result = json.optionChain?.result?.[0];
+    if (!result) throw new HttpError(502, `no chain returned for ${symbol}`);
+    const opt = result.options?.[0];
+    if (!opt) throw new HttpError(502, `no options block for ${symbol}`);
+
+    const spot = result.quote?.regularMarketPrice ?? 0;
+    const expiration = opt.expirationDate;
+    const expirationDate = new Date(expiration * 1000).toISOString().slice(0, 10);
+    const daysToExpiry = Math.max(0, (expiration - now) / 86400);
+
+    let rate = 0.045;
+    try {
+      const tnx = await env.DB
+        .prepare(`SELECT close FROM bars WHERE symbol='^TNX' AND interval='1min' ORDER BY ts DESC LIMIT 1`)
+        .first<{ close: number }>();
+      if (tnx && tnx.close > 0) rate = tnx.close / 100;
+    } catch {
+      // Stick with default rate.
+    }
+
+    const yearsToExpiry = daysToExpiry / 365;
+    const calls = (opt.calls ?? []).map((c) => toContract(c, spot, rate, yearsToExpiry, 'call'));
+    const puts = (opt.puts ?? []).map((c) => toContract(c, spot, rate, yearsToExpiry, 'put'));
+
+    response = {
+      symbol,
+      spot,
+      dayHigh: null,
+      dayLow: null,
+      dayChange: null,
+      dayChangePct: null,
+      prevClose: null,
+      expiration,
+      expirationDate,
+      daysToExpiry: Math.round(daysToExpiry * 10) / 10,
+      availableExpirations: result.expirationDates ?? [],
+      calls,
+      puts,
+    };
+  }
+
+  // Overlay day stats from our own bars table — provider quotes for the
+  // underlying are inconsistent (CBOE sometimes nulls them, Yahoo's spot
+  // doesn't include H/L). We poll the symbol on a 1-min cadence so the
+  // bars-derived numbers are accurate to the minute.
+  const dayStats = await getDayStats(env, symbol);
+  response = { ...response, ...dayStats };
+
+  try {
+    await env.DB
+      .prepare(
+        `INSERT INTO json_cache(key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+      )
+      .bind(cacheKey, JSON.stringify(response), now)
+      .run();
+  } catch {
+    // Cache write is best-effort.
+  }
+  return response;
+}
+
+// Compute today's high/low/change for a symbol from our 1min bars. Returns
+// nulls when we don't have enough data (new symbol, weekend, etc.).
+async function getDayStats(env: Env, symbol: string): Promise<{
+  dayHigh: number | null;
+  dayLow: number | null;
+  dayChange: number | null;
+  dayChangePct: number | null;
+  prevClose: number | null;
+}> {
+  try {
+    // Most recent bar's ET date defines "today" — robust on weekends and
+    // pre/after-market.
+    const latest = await env.DB
+      .prepare(`SELECT ts FROM bars WHERE symbol=? AND interval='1min' ORDER BY ts DESC LIMIT 1`)
+      .bind(symbol)
+      .first<{ ts: number }>();
+    if (!latest) return { dayHigh: null, dayLow: null, dayChange: null, dayChangePct: null, prevClose: null };
+
+    // ET midnight before the latest bar (DST-aware: use the latest bar's
+    // own offset by re-deriving from the date string).
+    const latestEt = new Date((latest.ts - 5 * 3600) * 1000); // rough; refined below
+    const offsetH = isUsDst(latestEt) ? 4 : 5;
+    const latestEtCorrect = new Date((latest.ts - offsetH * 3600) * 1000);
+    const y = latestEtCorrect.getUTCFullYear();
+    const m = latestEtCorrect.getUTCMonth();
+    const d = latestEtCorrect.getUTCDate();
+    const dayStartUtcMs = Date.UTC(y, m, d, offsetH); // 00:00 ET in UTC
+    const dayStartTs = Math.floor(dayStartUtcMs / 1000);
+
+    const today = await env.DB
+      .prepare(
+        `SELECT MAX(high) AS hi, MIN(low) AS lo, close FROM bars
+         WHERE symbol=? AND interval='1min' AND ts >= ?`,
+      )
+      .bind(symbol, dayStartTs)
+      .first<{ hi: number | null; lo: number | null; close: number | null }>();
+
+    const prev = await env.DB
+      .prepare(
+        `SELECT close FROM bars
+         WHERE symbol=? AND interval='1min' AND ts < ?
+         ORDER BY ts DESC LIMIT 1`,
+      )
+      .bind(symbol, dayStartTs)
+      .first<{ close: number | null }>();
+
+    const dayHigh = today?.hi ?? null;
+    const dayLow = today?.lo ?? null;
+    const prevClose = prev?.close ?? null;
+    const lastClose = today?.close ?? null;
+    const dayChange = lastClose !== null && prevClose !== null ? lastClose - prevClose : null;
+    const dayChangePct = dayChange !== null && prevClose && prevClose > 0
+      ? dayChange / prevClose
+      : null;
+    return { dayHigh, dayLow, dayChange, dayChangePct, prevClose };
+  } catch {
+    return { dayHigh: null, dayLow: null, dayChange: null, dayChangePct: null, prevClose: null };
+  }
+}
+
+// US DST: second Sunday of March through first Sunday of November.
+function isUsDst(date: Date): boolean {
+  const y = date.getUTCFullYear();
+  const marchSecondSun = (() => {
+    const d = new Date(Date.UTC(y, 2, 1));
+    const dow = d.getUTCDay();
+    const firstSun = dow === 0 ? 1 : 8 - dow;
+    return firstSun + 7;
+  })();
+  const novFirstSun = (() => {
+    const d = new Date(Date.UTC(y, 10, 1));
+    const dow = d.getUTCDay();
+    return dow === 0 ? 1 : 8 - dow;
+  })();
+  const start = Date.UTC(y, 2, marchSecondSun, 7); // 2am ET = 7am UTC (EST)
+  const end = Date.UTC(y, 10, novFirstSun, 6); // 2am ET = 6am UTC (EDT)
+  const t = date.getTime();
+  return t >= start && t < end;
+}
+
+interface YahooOptionsResponse {
+  optionChain?: {
+    result?: Array<{
+      underlyingSymbol?: string;
+      expirationDates?: number[];
+      strikes?: number[];
+      quote?: { regularMarketPrice?: number };
+      options?: Array<{
+        expirationDate: number;
+        calls?: YahooContractRaw[];
+        puts?: YahooContractRaw[];
+      }>;
+    }>;
+  };
+}
+
+interface YahooContractRaw {
+  contractSymbol: string;
+  strike: number;
+  bid?: number;
+  ask?: number;
+  lastPrice?: number;
+  volume?: number;
+  openInterest?: number;
+  impliedVolatility?: number;
+  inTheMoney?: boolean;
+}
+
+interface FinnhubOptionsResponse {
+  data?: Array<{
+    expirationDate?: string; // 'YYYY-MM-DD'
+    options?: {
+      CALL?: FinnhubContractRaw[];
+      PUT?: FinnhubContractRaw[];
+    };
+  }>;
+  symbol?: string;
+}
+
+interface FinnhubContractRaw {
+  contractName?: string;
+  strike?: number;
+  lastPrice?: number;
+  volume?: number;
+  openInterest?: number;
+  bid?: number;
+  ask?: number;
+  impliedVolatility?: number;
+  delta?: number;
+  gamma?: number;
+  theta?: number;
+  vega?: number;
+  inTheMoney?: string; // 'TRUE' / 'FALSE'
+}
+
+interface CboeOptionsResponse {
+  data?: {
+    symbol?: string;
+    current_price?: number;
+    bid?: number;
+    ask?: number;
+    options?: CboeContractRaw[];
+  };
+}
+
+interface CboeContractRaw {
+  option?: string; // OCC symbol, e.g. "AAPL250117C00100000"
+  bid?: number;
+  ask?: number;
+  iv?: number;
+  open_interest?: number;
+  volume?: number;
+  delta?: number;
+  gamma?: number;
+  theta?: number;
+  vega?: number;
+  last_trade_price?: number;
+  high?: number;
+  low?: number;
+}
+
+// Parse an OCC option symbol like "AAPL250117C00100000" into its parts.
+// Layout: <ROOT><YY><MM><DD><C|P><STRIKE*1000 padded to 8>. The root is
+// variable-length; the last 15 chars are fixed.
+function parseOccSymbol(occ: string): {
+  expirationUnix: number;
+  expirationDate: string;
+  kind: 'call' | 'put';
+  strike: number;
+} | null {
+  if (occ.length < 16) return null;
+  const tail = occ.slice(-15);
+  const yy = tail.slice(0, 2);
+  const mm = tail.slice(2, 4);
+  const dd = tail.slice(4, 6);
+  const typeChar = tail[6];
+  const strikeStr = tail.slice(7);
+  if (!/^\d{2}$/.test(yy) || !/^\d{2}$/.test(mm) || !/^\d{2}$/.test(dd)) return null;
+  if (typeChar !== 'C' && typeChar !== 'P') return null;
+  if (!/^\d{8}$/.test(strikeStr)) return null;
+  const isoDate = `20${yy}-${mm}-${dd}`;
+  const expirationUnix = Math.floor(Date.parse(isoDate + 'T20:00:00Z') / 1000);
+  if (!Number.isFinite(expirationUnix)) return null;
+  return {
+    expirationUnix,
+    expirationDate: isoDate,
+    kind: typeChar === 'C' ? 'call' : 'put',
+    strike: Number(strikeStr) / 1000,
+  };
+}
+
+// CBOE public delayed-quotes endpoint. No auth, ~15-min delayed, ships
+// greeks pre-computed. Returns null when the symbol isn't listed so the
+// caller can fall through.
+async function tryCboeChain(
+  symbol: string,
+  expirationTs: number | null,
+): Promise<OptionsChainResponse | null> {
+  // Strip a leading '^' for indices — CBOE uses an underscore prefix instead
+  // (e.g. ^SPX → _SPX.json). The Options UI already filters '^' tickers, but
+  // keep this here for completeness.
+  const cboeSymbol = symbol.startsWith('^') ? `_${symbol.slice(1)}` : symbol;
+  const url = `https://cdn.cboe.com/api/global/delayed_quotes/options/${encodeURIComponent(cboeSymbol)}.json`;
+  try {
+    const res = await fetch(url, {
+      headers: {
+        // CBOE's CDN is content-type-strict — Accept matters.
+        Accept: 'application/json',
+        'User-Agent': 'Mozilla/5.0 (compatible; stock-tracker/1.0)',
+      },
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!res.ok) return null;
+    const json = (await res.json()) as CboeOptionsResponse;
+    const data = json.data;
+    if (!data || !Array.isArray(data.options) || data.options.length === 0) return null;
+
+    const spot = typeof data.current_price === 'number' && data.current_price > 0
+      ? data.current_price
+      : (typeof data.bid === 'number' && typeof data.ask === 'number'
+        ? (data.bid + data.ask) / 2
+        : 0);
+
+    // Group contracts by expiration date.
+    const byExp = new Map<string, { unix: number; calls: OptionContract[]; puts: OptionContract[] }>();
+    for (const raw of data.options) {
+      if (!raw.option) continue;
+      const parsed = parseOccSymbol(raw.option);
+      if (!parsed) continue;
+      const bucket = byExp.get(parsed.expirationDate) ?? {
+        unix: parsed.expirationUnix,
+        calls: [],
+        puts: [],
+      };
+      const inTheMoney = spot > 0
+        ? (parsed.kind === 'call' ? spot > parsed.strike : spot < parsed.strike)
+        : false;
+      const contract: OptionContract = {
+        contractSymbol: raw.option,
+        strike: parsed.strike,
+        bid: typeof raw.bid === 'number' ? raw.bid : null,
+        ask: typeof raw.ask === 'number' ? raw.ask : null,
+        last: typeof raw.last_trade_price === 'number' ? raw.last_trade_price : null,
+        high: typeof raw.high === 'number' && raw.high > 0 ? raw.high : null,
+        low: typeof raw.low === 'number' && raw.low > 0 ? raw.low : null,
+        volume: typeof raw.volume === 'number' ? raw.volume : null,
+        openInterest: typeof raw.open_interest === 'number' ? raw.open_interest : null,
+        impliedVolatility: typeof raw.iv === 'number' ? raw.iv : null,
+        inTheMoney,
+        delta: typeof raw.delta === 'number' ? raw.delta : null,
+        gamma: typeof raw.gamma === 'number' ? raw.gamma : null,
+        theta: typeof raw.theta === 'number' ? raw.theta : null,
+        vega: typeof raw.vega === 'number' ? raw.vega : null,
+      };
+      if (parsed.kind === 'call') bucket.calls.push(contract);
+      else bucket.puts.push(contract);
+      byExp.set(parsed.expirationDate, bucket);
+    }
+
+    if (byExp.size === 0) return null;
+
+    const sortedExps = [...byExp.entries()].sort((a, b) => a[1].unix - b[1].unix);
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    // Pick the requested expiration (match by date), else the nearest
+    // future one.
+    let pickedDate: string;
+    if (expirationTs) {
+      const wantedDate = new Date(expirationTs * 1000).toISOString().slice(0, 10);
+      pickedDate = sortedExps.find(([d]) => d === wantedDate)?.[0]
+        ?? sortedExps.find(([, b]) => b.unix >= nowSec)?.[0]
+        ?? sortedExps[0]![0];
+    } else {
+      pickedDate = sortedExps.find(([, b]) => b.unix >= nowSec)?.[0] ?? sortedExps[0]![0];
+    }
+    const picked = byExp.get(pickedDate)!;
+    const daysToExpiry = Math.max(0, (picked.unix - nowSec) / 86400);
+
+    return {
+      symbol,
+      spot,
+      dayHigh: null,
+      dayLow: null,
+      dayChange: null,
+      dayChangePct: null,
+      prevClose: null,
+      expiration: picked.unix,
+      expirationDate: pickedDate,
+      daysToExpiry: Math.round(daysToExpiry * 10) / 10,
+      availableExpirations: sortedExps.map(([, b]) => b.unix),
+      calls: picked.calls.sort((a, b) => a.strike - b.strike),
+      puts: picked.puts.sort((a, b) => a.strike - b.strike),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Finnhub options chain. Returns null when the endpoint is paid-tier-gated
+// or otherwise unavailable, so the caller can fall through to Yahoo.
+async function tryFinnhubChain(
+  apiKey: string,
+  symbol: string,
+  expirationTs: number | null,
+): Promise<OptionsChainResponse | null> {
+  try {
+    const url = `https://finnhub.io/api/v1/stock/option-chain?symbol=${encodeURIComponent(symbol)}&token=${apiKey}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+    // Free tier sometimes returns 200 with an empty payload, sometimes 403.
+    if (!res.ok) return null;
+    const json = (await res.json()) as FinnhubOptionsResponse;
+    const expirations = (json.data ?? []).filter((d) => d.expirationDate);
+    if (expirations.length === 0) return null;
+
+    // Pick the requested expiration or the nearest one.
+    const wantedDate = expirationTs
+      ? new Date(expirationTs * 1000).toISOString().slice(0, 10)
+      : null;
+    const picked = wantedDate
+      ? expirations.find((d) => d.expirationDate === wantedDate) ?? expirations[0]!
+      : expirations[0]!;
+    if (!picked.options) return null;
+
+    const expirationDate = picked.expirationDate!;
+    const expirationUnix = Math.floor(Date.parse(expirationDate + 'T20:00:00Z') / 1000);
+    const nowSec = Math.floor(Date.now() / 1000);
+    const daysToExpiry = Math.max(0, (expirationUnix - nowSec) / 86400);
+
+    const toC = (c: FinnhubContractRaw): OptionContract => ({
+      contractSymbol: c.contractName ?? '',
+      strike: c.strike ?? 0,
+      bid: typeof c.bid === 'number' ? c.bid : null,
+      ask: typeof c.ask === 'number' ? c.ask : null,
+      last: typeof c.lastPrice === 'number' ? c.lastPrice : null,
+      high: null,
+      low: null,
+      volume: typeof c.volume === 'number' ? c.volume : null,
+      openInterest: typeof c.openInterest === 'number' ? c.openInterest : null,
+      impliedVolatility: typeof c.impliedVolatility === 'number' ? c.impliedVolatility : null,
+      inTheMoney: c.inTheMoney === 'TRUE',
+      delta: typeof c.delta === 'number' ? c.delta : null,
+      gamma: typeof c.gamma === 'number' ? c.gamma : null,
+      theta: typeof c.theta === 'number' ? c.theta : null,
+      vega: typeof c.vega === 'number' ? c.vega : null,
+    });
+
+    const calls = (picked.options.CALL ?? []).map(toC).sort((a, b) => a.strike - b.strike);
+    const puts = (picked.options.PUT ?? []).map(toC).sort((a, b) => a.strike - b.strike);
+
+    // Approximate spot from ATM strike (where call delta ≈ 0.5). Finnhub
+    // doesn't return the underlying spot in the same payload.
+    let spot = 0;
+    const atm = calls.find((c) => c.delta !== null && c.delta > 0.5);
+    if (atm && atm.strike > 0) spot = atm.strike;
+    else if (calls.length > 0) spot = calls[Math.floor(calls.length / 2)]!.strike;
+
+    const availableExpirations = expirations.map((d) =>
+      Math.floor(Date.parse(d.expirationDate! + 'T20:00:00Z') / 1000),
+    );
+
+    return {
+      symbol,
+      spot,
+      dayHigh: null,
+      dayLow: null,
+      dayChange: null,
+      dayChangePct: null,
+      prevClose: null,
+      expiration: expirationUnix,
+      expirationDate,
+      daysToExpiry: Math.round(daysToExpiry * 10) / 10,
+      availableExpirations,
+      calls,
+      puts,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function toContract(
+  c: YahooContractRaw,
+  spot: number,
+  rate: number,
+  t: number,
+  kind: 'call' | 'put',
+): OptionContract {
+  const iv = typeof c.impliedVolatility === 'number' && c.impliedVolatility > 0 ? c.impliedVolatility : null;
+  const greeks = iv && spot > 0 && c.strike > 0 && t > 0
+    ? blackScholesGreeks(spot, c.strike, rate, iv, t, kind)
+    : { delta: null, gamma: null, theta: null, vega: null };
+  return {
+    contractSymbol: c.contractSymbol,
+    strike: c.strike,
+    bid: c.bid ?? null,
+    ask: c.ask ?? null,
+    last: c.lastPrice ?? null,
+    high: null,
+    low: null,
+    volume: c.volume ?? null,
+    openInterest: c.openInterest ?? null,
+    impliedVolatility: iv,
+    inTheMoney: !!c.inTheMoney,
+    ...greeks,
+  };
+}
+
+// Black-Scholes greeks. Uses ^TNX as the risk-free rate; assumes zero
+// dividend yield (slight bias for high-divvy underlyings but close enough
+// for ATM-near strikes used for swing trades). N(x) approximation is
+// Abramowitz-Stegun 7.1.26 — accurate to ~7e-8 across the real line.
+function blackScholesGreeks(
+  s: number,
+  k: number,
+  r: number,
+  sigma: number,
+  t: number,
+  kind: 'call' | 'put',
+): { delta: number; gamma: number; theta: number; vega: number } {
+  const sqrtT = Math.sqrt(t);
+  const d1 = (Math.log(s / k) + (r + (sigma * sigma) / 2) * t) / (sigma * sqrtT);
+  const d2 = d1 - sigma * sqrtT;
+  const nd1 = normalCdf(d1);
+  const npd1 = normalPdf(d1);
+  const nd2 = normalCdf(d2);
+  let delta: number;
+  let theta: number;
+  if (kind === 'call') {
+    delta = nd1;
+    theta = (-(s * npd1 * sigma) / (2 * sqrtT) - r * k * Math.exp(-r * t) * nd2) / 365;
+  } else {
+    delta = nd1 - 1;
+    theta = (-(s * npd1 * sigma) / (2 * sqrtT) + r * k * Math.exp(-r * t) * normalCdf(-d2)) / 365;
+  }
+  const gamma = npd1 / (s * sigma * sqrtT);
+  const vega = (s * npd1 * sqrtT) / 100; // per 1% IV change
+  return { delta, gamma, theta, vega };
+}
+
+function normalCdf(x: number): number {
+  const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741;
+  const a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+  const sign = x < 0 ? -1 : 1;
+  const ax = Math.abs(x) / Math.SQRT2;
+  const t = 1 / (1 + p * ax);
+  const y = 1 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-ax * ax);
+  return 0.5 * (1 + sign * y);
+}
+
+function normalPdf(x: number): number {
+  return Math.exp(-(x * x) / 2) / Math.sqrt(2 * Math.PI);
+}
+
+interface KronosForecastInput {
+  symbol: string;
+  horizon_days: number;
+  current_close: number;
+  forecast_close: number;
+  forecast_high?: number | null;
+  forecast_low?: number | null;
+  forecast_p10?: number | null;
+  forecast_p90?: number | null;
+  sample_count: number;
+}
+
+interface KronosForecastRow {
+  symbol: string;
+  generated_at: number;
+  horizon_days: number;
+  current_close: number;
+  forecast_close: number;
+  forecast_high: number | null;
+  forecast_low: number | null;
+  forecast_p10: number | null;
+  forecast_p90: number | null;
+  expected_return_pct: number;
+  sample_count: number;
+  model_name: string;
+}
+
+interface KronosBacktestInput {
+  symbol: string;
+  horizon_days: number;
+  n_runs: number;
+  hit_rate: number;
+  mae_pct: number;
+  signed_err_pct: number;
+  long_only_return_pct?: number | null;
+  buy_hold_return_pct?: number | null;
+}
+
+interface KronosBacktestRow {
+  symbol: string;
+  horizon_days: number;
+  computed_at: number;
+  n_runs: number;
+  hit_rate: number;
+  mae_pct: number;
+  signed_err_pct: number;
+  long_only_return_pct: number | null;
+  buy_hold_return_pct: number | null;
+  model_name: string;
+}
+
+async function getKronosLatest(env: Env): Promise<(KronosForecastRow & {
+  hit_rate: number | null;
+  mae_pct: number | null;
+  n_runs: number | null;
+})[]> {
+  // For each symbol, return the latest forecast joined with the matching
+  // backtest row (if any). LEFT JOIN so symbols without a backtest still
+  // surface their forecast.
+  const rows = await env.DB
+    .prepare(
+      `SELECT k.*,
+              b.hit_rate AS hit_rate,
+              b.mae_pct AS mae_pct,
+              b.n_runs AS n_runs
+       FROM kronos_forecasts k
+       JOIN (
+         SELECT symbol, MAX(generated_at) AS mx
+         FROM kronos_forecasts
+         GROUP BY symbol
+       ) latest ON latest.symbol = k.symbol AND latest.mx = k.generated_at
+       LEFT JOIN kronos_backtest b
+         ON b.symbol = k.symbol AND b.horizon_days = k.horizon_days
+       ORDER BY k.symbol`,
+    )
+    .all<KronosForecastRow & {
+      hit_rate: number | null;
+      mae_pct: number | null;
+      n_runs: number | null;
+    }>();
+  return rows.results ?? [];
+}
+
+async function getKronosBacktest(env: Env): Promise<KronosBacktestRow[]> {
+  const rows = await env.DB
+    .prepare(`SELECT * FROM kronos_backtest ORDER BY symbol, horizon_days`)
+    .all<KronosBacktestRow>();
+  return rows.results ?? [];
+}
+
+async function postKronosForecasts(env: Env, request: Request): Promise<{ ok: true; written: number; generated_at: number }> {
+  if (!env.KRONOS_API_KEY) {
+    throw new HttpError(503, 'KRONOS_API_KEY not configured on api worker');
+  }
+  const auth = request.headers.get('Authorization') ?? '';
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (!bearer || bearer !== env.KRONOS_API_KEY) {
+    throw new HttpError(401, 'invalid bearer token');
+  }
+
+  let body: { model?: string; generated_at?: number; forecasts?: KronosForecastInput[] };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    throw new HttpError(400, 'body must be JSON');
+  }
+  const model = (body.model ?? '').trim();
+  if (!model) throw new HttpError(400, 'model required');
+  const generatedAt = Number.isFinite(body.generated_at)
+    ? Math.floor(Number(body.generated_at))
+    : Math.floor(Date.now() / 1000);
+  const forecasts = Array.isArray(body.forecasts) ? body.forecasts : [];
+  if (forecasts.length === 0) throw new HttpError(400, 'no forecasts');
+
+  // Validate every row before any write so a partial batch can't poison
+  // the table. D1 batch() commits all-or-nothing.
+  const stmts: D1PreparedStatement[] = [];
+  for (const f of forecasts) {
+    if (!f.symbol || typeof f.symbol !== 'string') throw new HttpError(400, 'symbol required');
+    if (!Number.isFinite(f.horizon_days) || f.horizon_days <= 0) throw new HttpError(400, 'horizon_days required');
+    if (!Number.isFinite(f.current_close) || f.current_close <= 0) throw new HttpError(400, `bad current_close for ${f.symbol}`);
+    if (!Number.isFinite(f.forecast_close) || f.forecast_close <= 0) throw new HttpError(400, `bad forecast_close for ${f.symbol}`);
+    const expectedReturnPct = (f.forecast_close - f.current_close) / f.current_close;
+    stmts.push(
+      env.DB
+        .prepare(
+          `INSERT INTO kronos_forecasts(
+             symbol, generated_at, horizon_days,
+             current_close, forecast_close, forecast_high, forecast_low,
+             forecast_p10, forecast_p90,
+             expected_return_pct, sample_count, model_name
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(symbol, generated_at, horizon_days) DO UPDATE SET
+             current_close = excluded.current_close,
+             forecast_close = excluded.forecast_close,
+             forecast_high = excluded.forecast_high,
+             forecast_low = excluded.forecast_low,
+             forecast_p10 = excluded.forecast_p10,
+             forecast_p90 = excluded.forecast_p90,
+             expected_return_pct = excluded.expected_return_pct,
+             sample_count = excluded.sample_count,
+             model_name = excluded.model_name`,
+        )
+        .bind(
+          f.symbol.toUpperCase(),
+          generatedAt,
+          Math.floor(f.horizon_days),
+          f.current_close,
+          f.forecast_close,
+          Number.isFinite(f.forecast_high) ? f.forecast_high : null,
+          Number.isFinite(f.forecast_low) ? f.forecast_low : null,
+          Number.isFinite(f.forecast_p10) ? f.forecast_p10 : null,
+          Number.isFinite(f.forecast_p90) ? f.forecast_p90 : null,
+          expectedReturnPct,
+          Math.max(1, Math.floor(f.sample_count ?? 1)),
+          model,
+        ),
+    );
+  }
+  await env.DB.batch(stmts);
+  return { ok: true, written: stmts.length, generated_at: generatedAt };
+}
+
+async function postKronosBacktest(env: Env, request: Request): Promise<{ ok: true; written: number; computed_at: number }> {
+  if (!env.KRONOS_API_KEY) {
+    throw new HttpError(503, 'KRONOS_API_KEY not configured on api worker');
+  }
+  const auth = request.headers.get('Authorization') ?? '';
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (!bearer || bearer !== env.KRONOS_API_KEY) {
+    throw new HttpError(401, 'invalid bearer token');
+  }
+
+  let body: { model?: string; computed_at?: number; results?: KronosBacktestInput[] };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    throw new HttpError(400, 'body must be JSON');
+  }
+  const model = (body.model ?? '').trim();
+  if (!model) throw new HttpError(400, 'model required');
+  const computedAt = Number.isFinite(body.computed_at)
+    ? Math.floor(Number(body.computed_at))
+    : Math.floor(Date.now() / 1000);
+  const results = Array.isArray(body.results) ? body.results : [];
+  if (results.length === 0) throw new HttpError(400, 'no results');
+
+  const stmts: D1PreparedStatement[] = [];
+  for (const r of results) {
+    if (!r.symbol || typeof r.symbol !== 'string') throw new HttpError(400, 'symbol required');
+    if (!Number.isFinite(r.horizon_days) || r.horizon_days <= 0) throw new HttpError(400, 'horizon_days required');
+    if (!Number.isFinite(r.n_runs) || r.n_runs < 0) throw new HttpError(400, `bad n_runs for ${r.symbol}`);
+    if (!Number.isFinite(r.hit_rate)) throw new HttpError(400, `bad hit_rate for ${r.symbol}`);
+    if (!Number.isFinite(r.mae_pct)) throw new HttpError(400, `bad mae_pct for ${r.symbol}`);
+    if (!Number.isFinite(r.signed_err_pct)) throw new HttpError(400, `bad signed_err_pct for ${r.symbol}`);
+    stmts.push(
+      env.DB
+        .prepare(
+          `INSERT INTO kronos_backtest(
+             symbol, horizon_days, computed_at, n_runs,
+             hit_rate, mae_pct, signed_err_pct,
+             long_only_return_pct, buy_hold_return_pct, model_name
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(symbol, horizon_days) DO UPDATE SET
+             computed_at = excluded.computed_at,
+             n_runs = excluded.n_runs,
+             hit_rate = excluded.hit_rate,
+             mae_pct = excluded.mae_pct,
+             signed_err_pct = excluded.signed_err_pct,
+             long_only_return_pct = excluded.long_only_return_pct,
+             buy_hold_return_pct = excluded.buy_hold_return_pct,
+             model_name = excluded.model_name`,
+        )
+        .bind(
+          r.symbol.toUpperCase(),
+          Math.floor(r.horizon_days),
+          computedAt,
+          Math.floor(r.n_runs),
+          r.hit_rate,
+          r.mae_pct,
+          r.signed_err_pct,
+          Number.isFinite(r.long_only_return_pct) ? r.long_only_return_pct : null,
+          Number.isFinite(r.buy_hold_return_pct) ? r.buy_hold_return_pct : null,
+          model,
+        ),
+    );
+  }
+  await env.DB.batch(stmts);
+  return { ok: true, written: stmts.length, computed_at: computedAt };
+}
+
+interface ChronosForecastInput {
+  symbol: string;
+  horizon_days: number;
+  current_close: number;
+  forecast_close: number;
+  forecast_p10?: number | null;
+  forecast_p90?: number | null;
+  sample_count: number;
+}
+
+interface ChronosForecastRow {
+  symbol: string;
+  generated_at: number;
+  horizon_days: number;
+  current_close: number;
+  forecast_close: number;
+  forecast_p10: number | null;
+  forecast_p90: number | null;
+  expected_return_pct: number;
+  sample_count: number;
+  model_name: string;
+}
+
+interface ChronosBacktestInput {
+  symbol: string;
+  horizon_days: number;
+  n_runs: number;
+  hit_rate: number;
+  mae_pct: number;
+  signed_err_pct: number;
+  long_only_return_pct?: number | null;
+  buy_hold_return_pct?: number | null;
+}
+
+interface ChronosBacktestRow {
+  symbol: string;
+  horizon_days: number;
+  computed_at: number;
+  n_runs: number;
+  hit_rate: number;
+  mae_pct: number;
+  signed_err_pct: number;
+  long_only_return_pct: number | null;
+  buy_hold_return_pct: number | null;
+  model_name: string;
+}
+
+async function getChronosLatest(env: Env): Promise<(ChronosForecastRow & {
+  hit_rate: number | null;
+  mae_pct: number | null;
+  n_runs: number | null;
+})[]> {
+  const rows = await env.DB
+    .prepare(
+      `SELECT c.*,
+              b.hit_rate AS hit_rate,
+              b.mae_pct AS mae_pct,
+              b.n_runs AS n_runs
+       FROM chronos_forecasts c
+       JOIN (
+         SELECT symbol, MAX(generated_at) AS mx
+         FROM chronos_forecasts
+         GROUP BY symbol
+       ) latest ON latest.symbol = c.symbol AND latest.mx = c.generated_at
+       LEFT JOIN chronos_backtest b
+         ON b.symbol = c.symbol AND b.horizon_days = c.horizon_days
+       ORDER BY c.symbol`,
+    )
+    .all<ChronosForecastRow & {
+      hit_rate: number | null;
+      mae_pct: number | null;
+      n_runs: number | null;
+    }>();
+  return rows.results ?? [];
+}
+
+async function getChronosBacktest(env: Env): Promise<ChronosBacktestRow[]> {
+  const rows = await env.DB
+    .prepare(`SELECT * FROM chronos_backtest ORDER BY symbol, horizon_days`)
+    .all<ChronosBacktestRow>();
+  return rows.results ?? [];
+}
+
+async function postChronosForecasts(env: Env, request: Request): Promise<{ ok: true; written: number; generated_at: number }> {
+  if (!env.KRONOS_API_KEY) {
+    throw new HttpError(503, 'KRONOS_API_KEY not configured on api worker');
+  }
+  const auth = request.headers.get('Authorization') ?? '';
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (!bearer || bearer !== env.KRONOS_API_KEY) {
+    throw new HttpError(401, 'invalid bearer token');
+  }
+
+  let body: { model?: string; generated_at?: number; forecasts?: ChronosForecastInput[] };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    throw new HttpError(400, 'body must be JSON');
+  }
+  const model = (body.model ?? '').trim();
+  if (!model) throw new HttpError(400, 'model required');
+  const generatedAt = Number.isFinite(body.generated_at)
+    ? Math.floor(Number(body.generated_at))
+    : Math.floor(Date.now() / 1000);
+  const forecasts = Array.isArray(body.forecasts) ? body.forecasts : [];
+  if (forecasts.length === 0) throw new HttpError(400, 'no forecasts');
+
+  const stmts: D1PreparedStatement[] = [];
+  for (const f of forecasts) {
+    if (!f.symbol || typeof f.symbol !== 'string') throw new HttpError(400, 'symbol required');
+    if (!Number.isFinite(f.horizon_days) || f.horizon_days <= 0) throw new HttpError(400, 'horizon_days required');
+    if (!Number.isFinite(f.current_close) || f.current_close <= 0) throw new HttpError(400, `bad current_close for ${f.symbol}`);
+    if (!Number.isFinite(f.forecast_close) || f.forecast_close <= 0) throw new HttpError(400, `bad forecast_close for ${f.symbol}`);
+    const expectedReturnPct = (f.forecast_close - f.current_close) / f.current_close;
+    stmts.push(
+      env.DB
+        .prepare(
+          `INSERT INTO chronos_forecasts(
+             symbol, generated_at, horizon_days,
+             current_close, forecast_close, forecast_p10, forecast_p90,
+             expected_return_pct, sample_count, model_name
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(symbol, generated_at, horizon_days) DO UPDATE SET
+             current_close = excluded.current_close,
+             forecast_close = excluded.forecast_close,
+             forecast_p10 = excluded.forecast_p10,
+             forecast_p90 = excluded.forecast_p90,
+             expected_return_pct = excluded.expected_return_pct,
+             sample_count = excluded.sample_count,
+             model_name = excluded.model_name`,
+        )
+        .bind(
+          f.symbol.toUpperCase(),
+          generatedAt,
+          Math.floor(f.horizon_days),
+          f.current_close,
+          f.forecast_close,
+          Number.isFinite(f.forecast_p10) ? f.forecast_p10 : null,
+          Number.isFinite(f.forecast_p90) ? f.forecast_p90 : null,
+          expectedReturnPct,
+          Math.max(1, Math.floor(f.sample_count ?? 1)),
+          model,
+        ),
+    );
+  }
+  await env.DB.batch(stmts);
+  return { ok: true, written: stmts.length, generated_at: generatedAt };
+}
+
+async function postChronosBacktest(env: Env, request: Request): Promise<{ ok: true; written: number; computed_at: number }> {
+  if (!env.KRONOS_API_KEY) {
+    throw new HttpError(503, 'KRONOS_API_KEY not configured on api worker');
+  }
+  const auth = request.headers.get('Authorization') ?? '';
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (!bearer || bearer !== env.KRONOS_API_KEY) {
+    throw new HttpError(401, 'invalid bearer token');
+  }
+
+  let body: { model?: string; computed_at?: number; results?: ChronosBacktestInput[] };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    throw new HttpError(400, 'body must be JSON');
+  }
+  const model = (body.model ?? '').trim();
+  if (!model) throw new HttpError(400, 'model required');
+  const computedAt = Number.isFinite(body.computed_at)
+    ? Math.floor(Number(body.computed_at))
+    : Math.floor(Date.now() / 1000);
+  const results = Array.isArray(body.results) ? body.results : [];
+  if (results.length === 0) throw new HttpError(400, 'no results');
+
+  const stmts: D1PreparedStatement[] = [];
+  for (const r of results) {
+    if (!r.symbol || typeof r.symbol !== 'string') throw new HttpError(400, 'symbol required');
+    if (!Number.isFinite(r.horizon_days) || r.horizon_days <= 0) throw new HttpError(400, 'horizon_days required');
+    stmts.push(
+      env.DB
+        .prepare(
+          `INSERT INTO chronos_backtest(
+             symbol, horizon_days, computed_at, n_runs,
+             hit_rate, mae_pct, signed_err_pct,
+             long_only_return_pct, buy_hold_return_pct, model_name
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(symbol, horizon_days) DO UPDATE SET
+             computed_at = excluded.computed_at,
+             n_runs = excluded.n_runs,
+             hit_rate = excluded.hit_rate,
+             mae_pct = excluded.mae_pct,
+             signed_err_pct = excluded.signed_err_pct,
+             long_only_return_pct = excluded.long_only_return_pct,
+             buy_hold_return_pct = excluded.buy_hold_return_pct,
+             model_name = excluded.model_name`,
+        )
+        .bind(
+          r.symbol.toUpperCase(),
+          Math.floor(r.horizon_days),
+          computedAt,
+          Math.floor(r.n_runs),
+          r.hit_rate,
+          r.mae_pct,
+          r.signed_err_pct,
+          Number.isFinite(r.long_only_return_pct) ? r.long_only_return_pct : null,
+          Number.isFinite(r.buy_hold_return_pct) ? r.buy_hold_return_pct : null,
+          model,
+        ),
+    );
+  }
+  await env.DB.batch(stmts);
+  return { ok: true, written: stmts.length, computed_at: computedAt };
+}
+

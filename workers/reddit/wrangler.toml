@@ -1,0 +1,30 @@
+name = "stock-tracker-reddit"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+# Scrape every 15 minutes. Reddit's public JSON endpoint isn't OAuth'd but is
+# soft-rate-limited; 15min keeps us well under the threshold while still
+# surfacing trends with usable resolution.
+[triggers]
+crons = ["*/15 * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "stock-tracker"
+# Same id as in workers/ingest/wrangler.toml.
+database_id = "aa7f811d-46b5-4d1f-b2b8-f6fc5b0b43d6"
+
+[vars]
+SUBREDDITS = "wallstreetbets"
+# How many posts to pull from each listing per scrape. Reddit caps at 100.
+POSTS_PER_LISTING = "100"
+# Listings to hit. 'hot' captures momentum; 'new' captures emerging chatter
+# before it's voted up.
+LISTINGS = "hot,new"
+# User agent string Reddit asks for. Customize before deploying.
+REDDIT_USER_AGENT = "web:com.chris-stocks.stock-tracker:0.1"
+
+# Optional secret if you want to use OAuth instead of the public endpoint:
+#   wrangler secret put REDDIT_CLIENT_ID
+#   wrangler secret put REDDIT_CLIENT_SECRET
+# Currently unused; the worker falls back to the public www.reddit.com JSON.
